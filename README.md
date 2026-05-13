@@ -82,7 +82,7 @@ patch_YYYYMMDD_HHMMSS_slug.zip
 
 ## Windows GUI / EXE
 
-В репозитории добавлен MVP Windows GUI поверх `devctl.py`:
+В репозитории добавлен MVP Windows GUI поверх `devctl.py`. GUI показывает карточки состояния, контекстное `Следующее действие`, dry-run план, live-лог запуска и отчёт:
 
 ```bash
 python gui/devctl_gui.py
@@ -97,3 +97,8 @@ python devctl.py start --json --no-push
 ```
 
 Инструкция по сборке переносимого Windows `.exe` лежит в [`gui/README_GUI.md`](gui/README_GUI.md). PyInstaller spec: [`build/pyinstaller.spec`](build/pyinstaller.spec). После сборки результат ожидается в `release/devctl-gui.exe`.
+
+
+## GUI v0.1.4 clickfix
+
+Исправлен сценарий, когда после построения dry-run плана нажатие `Запустить конвейер` визуально ничего не делало. Причина была в ошибке Tkinter-callback подтверждения запуска; теперь диалог подтверждения вызывается корректно, а неожиданные ошибки GUI показываются во вкладке `Отчёт`.

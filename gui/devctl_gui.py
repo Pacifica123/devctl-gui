@@ -6,6 +6,7 @@ import queue
 import subprocess
 import sys
 import threading
+import traceback
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -16,7 +17,7 @@ except ImportError:  # запуск как python -m gui.devctl_gui
     from .devctl_runner import DevctlRunner, RunResult  # type: ignore
 
 APP_NAME = "devctl GUI"
-APP_VERSION = "0.1.2"
+APP_VERSION = "0.1.4"
 
 
 def configure_standard_streams() -> None:
@@ -272,6 +273,7 @@ class DevctlGui(tk.Tk):
         self.last_plan: dict | None = None
         self.last_report_path: str | None = None
         self.last_archive_path: str | None = None
+        self.recommended_action_code = "refresh_status"
 
         self.config_data = load_config()
         default_workspace = initial_workspace(self.config_data)
@@ -282,6 +284,17 @@ class DevctlGui(tk.Tk):
         self._build_ui()
         self.after(100, self.refresh_status)
         self.after(100, self._drain_events)
+
+    def report_callback_exception(self, exc, val, tb) -> None:
+        """Показываем ошибки GUI-callback прямо пользователю.
+
+        В собранном .exe исключения Tkinter иначе легко выглядят как
+        «кнопка не нажимается»: traceback уходит в невидимую консоль.
+        """
+        details = "".join(traceback.format_exception(exc, val, tb))
+        self.set_text(self.report_text, "== ошибка GUI ==\n\n" + details)
+        self.notebook.select(2)
+        messagebox.showerror(APP_NAME, f"Ошибка в обработчике GUI:\n{val}", parent=self)
 
     def _setup_styles(self) -> None:
         style = ttk.Style(self)
@@ -296,6 +309,11 @@ class DevctlGui(tk.Tk):
         style.configure("CardOk.TLabel", background="#ffffff", foreground="#047857", font=("Segoe UI", 10, "bold"))
         style.configure("CardWarn.TLabel", background="#ffffff", foreground="#b45309", font=("Segoe UI", 10, "bold"))
         style.configure("CardBad.TLabel", background="#ffffff", foreground="#b91c1c", font=("Segoe UI", 10, "bold"))
+        style.configure("NextActionTitle.TLabel", background="#ffffff", foreground="#111827", font=("Segoe UI", 12, "bold"))
+        style.configure("NextActionBody.TLabel", background="#ffffff", foreground="#374151", font=("Segoe UI", 10))
+        style.configure("NextActionOk.TLabel", background="#ffffff", foreground="#047857", font=("Segoe UI", 12, "bold"))
+        style.configure("NextActionWarn.TLabel", background="#ffffff", foreground="#b45309", font=("Segoe UI", 12, "bold"))
+        style.configure("NextActionBad.TLabel", background="#ffffff", foreground="#b91c1c", font=("Segoe UI", 12, "bold"))
         style.configure("Magic.TButton", font=("Segoe UI", 13, "bold"), padding=(18, 12))
         style.configure("Action.TButton", font=("Segoe UI", 10), padding=(10, 7))
         style.configure("TLabel", font=("Segoe UI", 10))
@@ -309,7 +327,7 @@ class DevctlGui(tk.Tk):
         top = ttk.Frame(root, style="Main.TFrame")
         top.pack(fill="x")
         ttk.Label(top, text="Рабочая область", style="Header.TLabel").pack(side="left")
-        ttk.Label(top, text="devctl v0.4 · GUI v0.1.2", style="Subtle.TLabel").pack(side="right")
+        ttk.Label(top, text=f"devctl v0.4 · GUI v{APP_VERSION}", style="Subtle.TLabel").pack(side="right")
 
         path_row = ttk.Frame(root, style="Main.TFrame")
         path_row.pack(fill="x", pady=(8, 12))
@@ -332,7 +350,20 @@ class DevctlGui(tk.Tk):
             card.grid(row=0, column=index, sticky="nsew", padx=(0 if index == 0 else 8, 0))
             cards.columnconfigure(index, weight=1)
 
-        self.main_button = ttk.Button(root, text="Запустить конвейер", command=lambda: self.start_pipeline(False), style="Magic.TButton")
+        self.next_action_frame = ttk.Frame(root, padding=12, style="Card.TFrame")
+        self.next_action_frame.pack(fill="x", pady=(0, 12))
+        ttk.Label(self.next_action_frame, text="Следующее действие", style="CardTitle.TLabel").pack(anchor="w")
+        self.next_action_title = ttk.Label(self.next_action_frame, text="Проверить workspace", style="NextActionTitle.TLabel", wraplength=980)
+        self.next_action_title.pack(anchor="w", pady=(6, 0))
+        self.next_action_body = ttk.Label(
+            self.next_action_frame,
+            text="GUI сейчас обновит статус и подскажет безопасный следующий шаг.",
+            style="NextActionBody.TLabel",
+            wraplength=980,
+        )
+        self.next_action_body.pack(anchor="w", pady=(4, 0))
+
+        self.main_button = ttk.Button(root, text="Проверить workspace", command=self.perform_recommended_action, style="Magic.TButton")
         self.main_button.pack(fill="x", pady=(0, 12))
 
         self.notebook = ttk.Notebook(root)
@@ -374,6 +405,205 @@ class DevctlGui(tk.Tk):
         self.run_text.insert("end", value)
         self.run_text.see("end")
         self.run_text.configure(state="disabled")
+
+    def _set_next_action(self, code: str, title: str, details: str, button_text: str, kind: str = "neutral") -> None:
+        self.recommended_action_code = code
+        title_style = {
+            "ok": "NextActionOk.TLabel",
+            "warn": "NextActionWarn.TLabel",
+            "bad": "NextActionBad.TLabel",
+            "neutral": "NextActionTitle.TLabel",
+        }.get(kind, "NextActionTitle.TLabel")
+        self.next_action_title.configure(text=title, style=title_style)
+        self.next_action_body.configure(text=details)
+        self.main_button.configure(text=button_text)
+
+    def perform_recommended_action(self) -> None:
+        actions = {
+            "init_workspace": self.init_workspace,
+            "choose_workspace": self.choose_workspace,
+            "refresh_status": self.refresh_status,
+            "open_patches": self.open_patches,
+            "open_project": self.open_project,
+            "show_git_status": self.show_git_status,
+            "build_plan": self.build_plan,
+            "start_pipeline": lambda: self.start_pipeline(False),
+            "open_report": self.open_report,
+        }
+        action = actions.get(self.recommended_action_code, self.refresh_status)
+        action()
+
+    def _recommend_from_status(self, data: dict) -> None:
+        workspace = data.get("workspace", {}) if isinstance(data.get("workspace"), dict) else {}
+        git = data.get("git", {}) if isinstance(data.get("git"), dict) else {}
+        patches = data.get("patches", {}) if isinstance(data.get("patches"), dict) else {}
+        latest = patches.get("latest")
+
+        project_root = workspace.get("projectRoot") or "project/"
+        patches_dir = workspace.get("patchesDir") or "patches/"
+
+        if not workspace.get("projectExists"):
+            self._set_next_action(
+                "init_workspace",
+                "Создать или выбрать рабочую область devctl",
+                f"В текущем workspace не найден project/: {project_root}. Можно создать новый workspace мастером или выбрать уже существующий.",
+                "Инициализировать workspace",
+                "warn",
+            )
+            return
+
+        if not git.get("available"):
+            self._set_next_action(
+                "refresh_status",
+                "Установить или добавить Git в PATH",
+                "devctl не видит git.exe/git. Установите Git for Windows или добавьте его в PATH, затем обновите статус.",
+                "Обновить статус",
+                "bad",
+            )
+            return
+
+        if not git.get("isRepository"):
+            self._set_next_action(
+                "open_project",
+                "Проверить Git-репозиторий в project/",
+                f"Папка project/ найдена, но не является Git-репозиторием: {project_root}. Откройте её и выполните git init или создайте workspace через мастер.",
+                "Открыть project/",
+                "bad",
+            )
+            return
+
+        if git.get("clean") is False:
+            self._set_next_action(
+                "show_git_status",
+                "Разобраться с локальными изменениями Git",
+                "Рабочее дерево содержит локальные изменения. Перед запуском конвейера их нужно закоммитить, убрать или осознанно обработать вручную.",
+                "Показать git status",
+                "warn",
+            )
+            return
+
+        if not latest:
+            if self.last_report_path:
+                self._set_next_action(
+                    "open_report",
+                    "Посмотреть отчёт последнего запуска",
+                    "Неприменённых патчей сейчас нет. Можно открыть последний отчёт или добавить новый patch.zip в папку patches/.",
+                    "Открыть последний отчёт",
+                    "ok",
+                )
+            else:
+                self._set_next_action(
+                    "open_patches",
+                    "Добавить patch.zip в очередь",
+                    f"Патчи не найдены. Поместите следующий devctl-патч в папку: {patches_dir}",
+                    "Открыть patches/",
+                    "warn",
+                )
+            return
+
+        if latest.get("manifestError"):
+            self._set_next_action(
+                "build_plan",
+                "Посмотреть ошибку патча",
+                f"Найден patch.zip, но его манифест некорректен: {latest.get('manifestError')}. Постройте план, чтобы увидеть детали валидации.",
+                "Показать ошибку патча",
+                "bad",
+            )
+            return
+
+        title = latest.get("title") or latest.get("name") or "следующий патч"
+        self._set_next_action(
+            "build_plan",
+            "Построить прозрачный план запуска",
+            f"Workspace выглядит готовым. Следующий патч: {title}. Перед запуском лучше посмотреть dry-run план: файлы, проверки, commit и push.",
+            "Построить план",
+            "ok",
+        )
+
+    def _recommend_from_plan(self, data: dict, result: RunResult) -> None:
+        if not isinstance(data, dict) or not data:
+            self._set_next_action(
+                "refresh_status",
+                "Не удалось разобрать план",
+                result.stderr or result.stdout or "Команда plan не вернула JSON. Обновите статус и проверьте вкладку «План».",
+                "Обновить статус",
+                "bad",
+            )
+            return
+
+        if not data.get("ok"):
+            validation = data.get("validation") if isinstance(data.get("validation"), dict) else {}
+            error = validation.get("error") or data.get("error") or "Патч не прошёл dry-run проверку."
+            self._set_next_action(
+                "open_patches",
+                "Исправить или заменить patch.zip",
+                f"План построить нельзя: {error} После исправления положите обновлённый архив в patches/ и нажмите «Обновить».",
+                "Открыть patches/",
+                "bad",
+            )
+            return
+
+        patch = data.get("patch") if isinstance(data.get("patch"), dict) else {}
+        manifest = data.get("manifest") if isinstance(data.get("manifest"), dict) else {}
+        apply = data.get("apply") if isinstance(data.get("apply"), dict) else {}
+        checks = data.get("checks") if isinstance(data.get("checks"), list) else []
+        push = data.get("push") if isinstance(data.get("push"), dict) else {}
+
+        patch_title = manifest.get("title") or patch.get("title") or patch.get("name") or "патч"
+        push_text = "без push"
+        if push.get("enabled"):
+            push_text = f"push в {push.get('remote') or 'origin'}/{push.get('branch') or 'текущую ветку'}"
+        self._set_next_action(
+            "start_pipeline",
+            f"Запустить конвейер для патча «{patch_title}»",
+            "План готов: "
+            f"файлов к копированию — {apply.get('copyCount', 0)}, "
+            f"удалений — {apply.get('deleteCount', 0)}, "
+            f"проверок — {len(checks)}, {push_text}. После нажатия devctl применит патч, выполнит проверки, сделает commit и при необходимости push.",
+            "Запустить конвейер",
+            "ok",
+        )
+
+    def _recommend_after_result(self, data: dict, result: RunResult) -> None:
+        status = data.get("status") if isinstance(data, dict) else None
+        if result.returncode == 0:
+            self._set_next_action(
+                "open_report",
+                "Открыть отчёт успешного запуска",
+                f"Конвейер завершился со статусом {status or 'OK'}. Отчёт уже создан и содержит commit/push-сводку.",
+                "Открыть отчёт",
+                "ok",
+            )
+        else:
+            self._set_next_action(
+                "open_report",
+                "Разобрать ошибку по отчёту",
+                f"Конвейер остановился со статусом {status or 'ошибка'}. Откройте отчёт: там есть ошибки, предупреждения и путь к диагностическому архиву.",
+                "Открыть отчёт",
+                "bad",
+            )
+
+    def show_git_status(self) -> None:
+        data = self.last_status or {}
+        git = data.get("git", {}) if isinstance(data, dict) else {}
+        workspace = data.get("workspace", {}) if isinstance(data, dict) else {}
+        porcelain = git.get("porcelain") or git.get("statusShort") or ""
+        lines = [
+            "== git status ==",
+            f"Project: {workspace.get('projectRoot') or 'неизвестно'}",
+            f"Ветка: {git.get('branch') or 'неизвестно'}",
+            "",
+        ]
+        if porcelain.strip():
+            lines.append(porcelain.rstrip())
+        else:
+            lines.append("Локальные изменения не перечислены в status JSON. Откройте project/ и выполните git status вручную.")
+        lines.extend([
+            "",
+            "Перед запуском devctl приведите рабочее дерево к чистому состоянию: закоммитьте нужное, уберите временное или откатите лишнее.",
+        ])
+        self.set_text(self.plan_text, "\n".join(lines) + "\n")
+        self.notebook.select(0)
 
     def choose_workspace(self) -> None:
         selected = filedialog.askdirectory(title="Выберите корень рабочей области devctl")
@@ -532,6 +762,13 @@ class DevctlGui(tk.Tk):
             self.cards["git"].set("недоступно", "bad")
             self.cards["patch"].set("неизвестно", "warn")
             self.cards["push"].set("неизвестно", "warn")
+            self._set_next_action(
+                "choose_workspace",
+                "Выбрать корректную рабочую область",
+                str(text),
+                "Выбрать workspace",
+                "bad",
+            )
             self.set_text(self.plan_text, text)
             return
         workspace = data.get("workspace", {})
@@ -550,6 +787,7 @@ class DevctlGui(tk.Tk):
         else:
             self.cards["patch"].set("нет патчей", "warn")
         self.cards["push"].set("см. план" if latest else "неизвестно", "neutral")
+        self._recommend_from_status(data)
         self.set_text(self.plan_text, self._format_status(data))
 
     def _on_plan(self, result: RunResult) -> None:
@@ -561,6 +799,7 @@ class DevctlGui(tk.Tk):
             enabled = bool(push.get("enabled"))
             target = f"{push.get('remote')}/{push.get('branch')}" if push.get("remote") and push.get("branch") else "цель неизвестна"
             self.cards["push"].set(("будет выполнен: " if enabled else "отключён: ") + target, "ok" if enabled else "warn")
+        self._recommend_from_plan(data, result)
         self.notebook.select(0)
 
     def _format_status(self, data: dict) -> str:
@@ -663,7 +902,11 @@ class DevctlGui(tk.Tk):
         plan = self.last_plan
         if not plan or not plan.get("patch"):
             self.build_plan()
-            proceed = messagebox.askyesno(APP_NAME, "План обновляется. Запустить конвейер после текущей проверки лучше вручную. Всё равно запустить сейчас?")
+            proceed = messagebox.askyesno(
+                APP_NAME,
+                "План обновляется. Запустить конвейер после текущей проверки лучше вручную. Всё равно запустить сейчас?",
+                parent=self,
+            )
             if not proceed:
                 return
         else:
@@ -677,7 +920,7 @@ class DevctlGui(tk.Tk):
                 "",
                 "Запустить конвейер сейчас?",
             ]
-            if not messagebox.askyesno(APP_NAME, "Подтверждение запуска", "\n".join(message)):
+            if not messagebox.askyesno("Подтверждение запуска", "\n".join(message), parent=self):
                 return
         self.set_running(True)
         self.set_text(self.run_text, "")
@@ -706,8 +949,16 @@ class DevctlGui(tk.Tk):
             self.last_report_path = data.get("reportPath") or self.last_report_path
             self.last_archive_path = data.get("archivePath") or self.last_archive_path
             self.set_text(self.report_text, self._format_result(data, result))
+            self._recommend_after_result(data, result)
         else:
             self.set_text(self.report_text, result.stdout + ("\n" + result.stderr if result.stderr else ""))
+            self._set_next_action(
+                "refresh_status",
+                "Проверить состояние после запуска",
+                "Конвейер завершился без машинно-читаемого JSON. Обновите статус и проверьте лог запуска.",
+                "Обновить статус",
+                "warn",
+            )
         self.notebook.select(2)
         self.refresh_status()
         if result.returncode == 0:
@@ -760,6 +1011,11 @@ class DevctlGui(tk.Tk):
         data = self.last_status or {}
         workspace = data.get("workspace", {}) if isinstance(data, dict) else {}
         open_path(workspace.get("archivesDir"))
+
+    def open_patches(self) -> None:
+        data = self.last_status or {}
+        workspace = data.get("workspace", {}) if isinstance(data, dict) else {}
+        open_path(workspace.get("patchesDir"))
 
     def open_project(self) -> None:
         data = self.last_status or {}
