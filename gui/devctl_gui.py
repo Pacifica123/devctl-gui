@@ -17,8 +17,113 @@ except ImportError:  # запуск как python -m gui.devctl_gui
     from .devctl_runner import DevctlRunner, RunResult  # type: ignore
 
 APP_NAME = "devctl GUI"
-APP_VERSION = "0.1.4"
+APP_VERSION = "0.1.5"
 
+
+PATCH_PROMPT_TEMPLATE = """Ты работаешь с devctl workspace и должен вернуть не полный архив проекта, а полноценный devctl-патч.
+
+Контекст devctl:
+- workspace содержит project/, patches/, archives/ и .devctl/;
+- devctl применяет patch.zip из patches/ к папке project/;
+- патч должен быть безопасным, воспроизводимым и понятным человеку;
+- GUI/CLI ожидают структуру patch.zip с manifest.json, PATCH_SUMMARY.md и files/.
+
+Твоя задача:
+1. Изучи текущие файлы проекта, которые нужно менять. Не придумывай содержимое вслепую.
+2. Реализуй изменение минимально и аккуратно.
+3. Собери devctl patch.zip, а не весь проект.
+4. Проверь патч хотя бы синтаксически и, если возможно, через devctl plan/start на временном workspace.
+5. В ответе дай ссылку на patch.zip, SHA-256, краткое описание и список проверок.
+
+Обязательная структура архива:
+
+```text
+patch_YYYYMMDD_HHMMSS_short_slug.zip
+  manifest.json
+  PATCH_SUMMARY.md
+  files/
+    relative/path/in/project.ext
+```
+
+Правила для files/:
+- пути внутри files/ должны быть относительными к project/;
+- не клади абсолютные пути;
+- не клади .git/, .env, секреты, __pycache__/, *.pyc, .venv/, dist/, build/, node_modules/;
+- если devctl копирует целые файлы, клади в files/ уже финальные версии изменённых файлов;
+- не меняй unrelated-файлы ради косметики.
+
+Минимальный manifest.json:
+
+```json
+{
+  "formatVersion": 1,
+  "patchId": "YYYY-MM-DD-short-slug",
+  "title": "Короткое название патча",
+  "summary": "Что делает патч и зачем.",
+  "kind": "feature-or-fix",
+  "createdAt": "YYYY-MM-DDTHH:MM:SSZ",
+  "base": {
+    "branch": "main",
+    "expectedHead": null
+  },
+  "apply": {
+    "filesRoot": "files",
+    "delete": []
+  },
+  "checks": [
+    {
+      "name": "Python syntax без генерации __pycache__",
+      "cwd": ".",
+      "command": "python -c \"import ast,pathlib; files=['devctl.py']; [ast.parse(pathlib.Path(p).read_text(encoding='utf-8'), filename=p) for p in files]\"",
+      "requiredCommands": ["python"],
+      "timeoutSeconds": 120
+    }
+  ],
+  "commit": {
+    "message": "feat: кратко описать изменение"
+  },
+  "push": {
+    "remote": "origin",
+    "branch": "main"
+  },
+  "archive": {
+    "nameSlug": "short-slug",
+    "exclude": [
+      ".git/",
+      ".venv/",
+      "node_modules/",
+      "target/",
+      "dist/",
+      "build/",
+      "coverage/",
+      "__pycache__/",
+      ".pytest_cache/",
+      ".env",
+      ".env.*",
+      "*.sqlite",
+      "*.db"
+    ]
+  }
+}
+```
+
+Для Python-проектов предпочитай проверку через ast.parse, а не py_compile, чтобы проверка не создавала __pycache__.
+
+PATCH_SUMMARY.md должен объяснять:
+- что меняется;
+- зачем это нужно;
+- основные файлы;
+- риски;
+- проверки;
+- особые инструкции применения, если они есть.
+
+Финальный ответ пользователю должен быть коротким:
+- ссылка на patch.zip;
+- SHA-256;
+- что меняется;
+- какие проверки прогнаны;
+- если что-то не удалось проверить — честно указать.
+"""
 
 def configure_standard_streams() -> None:
     """Принудительно держим UTF-8 для child-процессов на Windows.
@@ -381,7 +486,8 @@ class DevctlGui(tk.Tk):
         self.report_btn = ttk.Button(actions, text="Открыть отчёт", command=self.open_report, style="Action.TButton")
         self.archives_btn = ttk.Button(actions, text="Открыть archives/", command=self.open_archives, style="Action.TButton")
         self.project_btn = ttk.Button(actions, text="Открыть project/", command=self.open_project, style="Action.TButton")
-        for widget in (self.init_btn, self.status_btn, self.plan_btn, self.no_push_btn, self.report_btn, self.archives_btn, self.project_btn):
+        self.copy_prompt_btn = ttk.Button(actions, text="Скопировать prompt-патча", command=self.copy_patch_prompt, style="Action.TButton")
+        for widget in (self.init_btn, self.status_btn, self.plan_btn, self.no_push_btn, self.report_btn, self.archives_btn, self.project_btn, self.copy_prompt_btn):
             widget.pack(side="left", padx=(0, 8))
 
     def _make_text_tab(self, title: str) -> tk.Text:
@@ -429,6 +535,7 @@ class DevctlGui(tk.Tk):
             "build_plan": self.build_plan,
             "start_pipeline": lambda: self.start_pipeline(False),
             "open_report": self.open_report,
+            "copy_patch_prompt": self.copy_patch_prompt,
         }
         action = actions.get(self.recommended_action_code, self.refresh_status)
         action()
@@ -604,6 +711,22 @@ class DevctlGui(tk.Tk):
         ])
         self.set_text(self.plan_text, "\n".join(lines) + "\n")
         self.notebook.select(0)
+
+    def copy_patch_prompt(self) -> None:
+        """Копирует в буфер обмена шаблон запроса для новой ChatGPT-сессии."""
+        text = PATCH_PROMPT_TEMPLATE.strip() + "\n"
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.update()
+        self.set_text(
+            self.report_text,
+            "== prompt-шаблон devctl-патча ==\n\n"
+            "Шаблон скопирован в буфер обмена. Его можно вставить в новую ChatGPT-сессию, "
+            "чтобы попросить собрать корректный devctl-патч для этого workspace.\n\n"
+            + text,
+        )
+        self.notebook.select(2)
+        messagebox.showinfo(APP_NAME, "Prompt-шаблон для devctl-патча скопирован в буфер обмена.", parent=self)
 
     def choose_workspace(self) -> None:
         selected = filedialog.askdirectory(title="Выберите корень рабочей области devctl")
@@ -939,7 +1062,7 @@ class DevctlGui(tk.Tk):
 
     def set_running(self, running: bool) -> None:
         state = "disabled" if running else "normal"
-        for widget in (self.main_button, self.no_push_btn, self.status_btn, self.plan_btn, self.init_btn, self.init_top_btn):
+        for widget in (self.main_button, self.no_push_btn, self.status_btn, self.plan_btn, self.init_btn, self.init_top_btn, self.copy_prompt_btn):
             widget.configure(state=state)
 
     def _on_start_done(self, result: RunResult) -> None:
