@@ -2093,14 +2093,202 @@ def maybe_emit_json(enabled: bool, payload: dict[str, Any]) -> None:
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
 
+def command_error_summary(result: CommandResult) -> str:
+    return result.stderr.strip() or result.stdout.strip() or f"код возврата {result.returncode}"
+
+
+def directory_has_entries(path: Path) -> bool:
+    try:
+        return any(path.iterdir())
+    except FileNotFoundError:
+        return False
+
+
+def local_branch_exists(project_root: Path, branch: str) -> bool:
+    result = git(project_root, ["show-ref", "--verify", f"refs/heads/{branch}"])
+    return result.returncode == 0
+
+
+def has_git_commit(project_root: Path) -> bool:
+    result = git(project_root, ["rev-parse", "--verify", "HEAD"])
+    return result.returncode == 0
+
+
+def set_origin_remote(project_root: Path, remote_url: str, result: dict[str, Any]) -> bool:
+    existing_remote = git(project_root, ["remote", "get-url", "origin"])
+    if existing_remote.returncode == 0:
+        set_result = git(project_root, ["remote", "set-url", "origin", remote_url])
+        action = "set-url"
+    else:
+        set_result = git(project_root, ["remote", "add", "origin", remote_url])
+        action = "add"
+    if set_result.returncode != 0:
+        result["errors"].append(f"git remote {action} origin завершился ошибкой: {command_error_summary(set_result)}")
+        return False
+    result["remoteLinked"] = True
+    result.setdefault("operations", []).append(f"remote {action} origin")
+    return True
+
+
+def fetch_origin(project_root: Path, result: dict[str, Any]) -> bool:
+    fetch_result = git(project_root, ["fetch", "--prune", "origin"], timeout=300)
+    if fetch_result.returncode != 0:
+        result["errors"].append(f"git fetch --prune origin завершился ошибкой: {command_error_summary(fetch_result)}")
+        return False
+    result.setdefault("operations", []).append("fetch --prune origin")
+    return True
+
+
+def ensure_requested_branch(project_root: Path, branch: str, result: dict[str, Any]) -> bool:
+    remote_branch_exists = remote_ref_exists(project_root, "origin", branch)
+    current_branch: str | None = None
+    try:
+        current_branch = git_branch(project_root)
+    except DevctlError:
+        current_branch = None
+
+    if remote_branch_exists:
+        if current_branch != branch:
+            if local_branch_exists(project_root, branch):
+                checkout = git(project_root, ["checkout", branch])
+            else:
+                checkout = git(project_root, ["checkout", "-B", branch, f"origin/{branch}"])
+            if checkout.returncode != 0:
+                result["errors"].append(f"git checkout {branch} завершился ошибкой: {command_error_summary(checkout)}")
+                return False
+            result.setdefault("operations", []).append(f"checkout {branch}")
+        result["branch"] = branch
+        return True
+
+    if not has_git_commit(project_root):
+        symbolic = git(project_root, ["symbolic-ref", "HEAD", f"refs/heads/{branch}"])
+        if symbolic.returncode != 0:
+            result["warnings"].append(command_error_summary(symbolic))
+        result["branch"] = branch
+        result["warnings"].append(
+            f"Remote-ветка origin/{branch} пока не найдена; репозиторий выглядит пустым, HEAD подготовлен для ветки {branch}."
+        )
+        return True
+
+    if current_branch == branch:
+        result["branch"] = branch
+        result["warnings"].append(f"Remote-ветка origin/{branch} не найдена; pull пропущен.")
+        return True
+
+    result["errors"].append(
+        f"Remote-ветка origin/{branch} не найдена. Укажите существующую ветку или загрузите репозиторий вручную."
+    )
+    return False
+
+
+def pull_requested_branch(project_root: Path, branch: str, result: dict[str, Any]) -> bool:
+    if not remote_ref_exists(project_root, "origin", branch):
+        result.setdefault("pullSkipped", True)
+        return True
+    pull_result = git(project_root, ["pull", "--ff-only", "origin", branch], timeout=300)
+    if pull_result.returncode != 0:
+        result["errors"].append(f"git pull --ff-only origin {branch} завершился ошибкой: {command_error_summary(pull_result)}")
+        return False
+    result.setdefault("operations", []).append(f"pull --ff-only origin {branch}")
+    result["pulled"] = True
+    return True
+
+
+def clone_remote_project(project_root: Path, *, branch: str, remote_url: str, result: dict[str, Any]) -> bool:
+    if project_root.exists() and not project_root.is_dir():
+        result["errors"].append(f"Путь project не является каталогом: {project_root}")
+        return False
+    if project_root.exists() and directory_has_entries(project_root):
+        result["errors"].append(
+            f"Нельзя клонировать remote в непустой каталог без .git: {project_root}. Выберите пустой workspace или очистите project/."
+        )
+        return False
+
+    project_root.parent.mkdir(parents=True, exist_ok=True)
+    clone_result = run_command(["git", "clone", remote_url, str(project_root)], project_root.parent, timeout=600)
+    if clone_result.returncode != 0:
+        result["errors"].append(f"git clone завершился ошибкой: {command_error_summary(clone_result)}")
+        return False
+
+    result["initialized"] = True
+    result["remoteLinked"] = True
+    result["cloned"] = True
+    result["operation"] = "clone"
+    result.setdefault("operations", []).append("clone")
+
+    # Явно делаем fetch/pull даже после clone: так init ведёт себя одинаково
+    # для нового и уже существующего локального project/.
+    if not fetch_origin(project_root, result):
+        return False
+    if not ensure_requested_branch(project_root, branch, result):
+        return False
+    if not pull_requested_branch(project_root, branch, result):
+        return False
+    result["synced"] = True
+    return True
+
+
+def sync_existing_git_project(project_root: Path, *, branch: str, remote_url: str, result: dict[str, Any]) -> bool:
+    result["initialized"] = True
+    result["operation"] = "fetch-pull"
+    if not set_origin_remote(project_root, remote_url, result):
+        return False
+    if not fetch_origin(project_root, result):
+        return False
+    if not ensure_requested_branch(project_root, branch, result):
+        return False
+    if not pull_requested_branch(project_root, branch, result):
+        return False
+    result["synced"] = True
+    return True
+
+
+def init_empty_git_repository(project_root: Path, *, branch: str, result: dict[str, Any]) -> bool:
+    git_dir = project_root / ".git"
+    if git_dir.exists():
+        result["initialized"] = True
+        try:
+            result["branch"] = git_branch(project_root)
+        except DevctlError:
+            result["branch"] = branch
+        return True
+
+    init_result = git(project_root, ["init", "-b", branch])
+    if init_result.returncode != 0:
+        # Старые версии Git могут не знать `git init -b`. Тогда создаём
+        # репозиторий обычным способом и вручную переводим HEAD на main.
+        init_result = git(project_root, ["init"])
+        if init_result.returncode == 0:
+            symbolic = git(project_root, ["symbolic-ref", "HEAD", f"refs/heads/{branch}"])
+            if symbolic.returncode != 0:
+                result["warnings"].append(command_error_summary(symbolic))
+    if init_result.returncode != 0:
+        result["errors"].append(command_error_summary(init_result) or "git init завершился ошибкой")
+        return False
+    result["initialized"] = True
+    result["branch"] = branch
+    result["operation"] = "init"
+    result.setdefault("operations", []).append("init")
+    return True
+
+
 def init_git_repository(project_root: Path, *, branch: str | None, remote_url: str | None) -> dict[str, Any]:
+    desired_branch = (branch or "main").strip() or "main"
+    remote_url = (remote_url or "").strip() or None
     result: dict[str, Any] = {
         "requested": True,
         "available": git_available(),
         "initialized": False,
-        "branch": branch or None,
+        "synced": False,
+        "cloned": False,
+        "pulled": False,
+        "pullSkipped": False,
+        "operation": None,
+        "operations": [],
+        "branch": desired_branch,
         "remote": "origin" if remote_url else None,
         "remoteUrl": remote_url or None,
+        "remoteLinked": False,
         "warnings": [],
         "errors": [],
     }
@@ -2108,48 +2296,17 @@ def init_git_repository(project_root: Path, *, branch: str | None, remote_url: s
         result["errors"].append("команда git не найдена")
         return result
 
-    git_dir = project_root / ".git"
-    desired_branch = (branch or "main").strip() or "main"
-    if git_dir.exists():
-        result["initialized"] = True
-        try:
-            result["branch"] = git_branch(project_root)
-        except DevctlError:
-            result["branch"] = desired_branch
-    else:
-        init_result = git(project_root, ["init", "-b", desired_branch])
-        if init_result.returncode != 0:
-            # Старые версии Git могут не знать `git init -b`. Тогда создаём
-            # репозиторий обычным способом и вручную переводим HEAD на main.
-            init_result = git(project_root, ["init"])
-            if init_result.returncode == 0:
-                symbolic = git(project_root, ["symbolic-ref", "HEAD", f"refs/heads/{desired_branch}"])
-                if symbolic.returncode != 0:
-                    result["warnings"].append(symbolic.stderr.strip() or symbolic.stdout.strip())
-        if init_result.returncode != 0:
-            result["errors"].append(init_result.stderr.strip() or init_result.stdout.strip() or "git init завершился ошибкой")
-            return result
-        result["initialized"] = True
-        result["branch"] = desired_branch
+    project_root.mkdir(parents=True, exist_ok=True)
 
     if remote_url:
-        existing_remote = git(project_root, ["remote", "get-url", "origin"])
-        if existing_remote.returncode == 0:
-            set_result = git(project_root, ["remote", "set-url", "origin", remote_url])
-            action = "set-url"
+        git_dir = project_root / ".git"
+        if git_dir.exists():
+            sync_existing_git_project(project_root, branch=desired_branch, remote_url=remote_url, result=result)
         else:
-            set_result = git(project_root, ["remote", "add", "origin", remote_url])
-            action = "add"
-        if set_result.returncode != 0:
-            result["errors"].append(
-                f"git remote {action} origin завершился ошибкой: "
-                + (set_result.stderr.strip() or set_result.stdout.strip())
-            )
-        else:
-            result["remoteLinked"] = True
-    else:
-        result["remoteLinked"] = False
+            clone_remote_project(project_root, branch=desired_branch, remote_url=remote_url, result=result)
+        return result
 
+    init_empty_git_repository(project_root, branch=desired_branch, result=result)
     return result
 
 
@@ -2177,7 +2334,7 @@ def init_command(args: argparse.Namespace) -> int:
         "configPath": str(config_path),
         "created": [],
         "warnings": [],
-        "git": {"requested": bool(getattr(args, "git_init", False))},
+        "git": {"requested": bool(getattr(args, "git_init", False) or (getattr(args, "remote_url", None) or "").strip())},
     }
 
     if config_path.exists() and not args.force:
@@ -2193,7 +2350,9 @@ def init_command(args: argparse.Namespace) -> int:
         if not existed:
             payload["created"].append(label)
 
-    should_create_project = bool(getattr(args, "create_project", False) or getattr(args, "git_init", False))
+    remote_url_arg = (getattr(args, "remote_url", None) or "").strip() or None
+    should_sync_git = bool(getattr(args, "git_init", False) or remote_url_arg)
+    should_create_project = bool(getattr(args, "create_project", False) or should_sync_git)
     if should_create_project:
         existed = project_root.exists()
         project_root.mkdir(parents=True, exist_ok=True)
@@ -2230,11 +2389,11 @@ def init_command(args: argparse.Namespace) -> int:
         write_json_file(state_dir / "state.json", {"version": STATE_VERSION, "runs": []})
 
     git_result: dict[str, Any] | None = None
-    if getattr(args, "git_init", False):
+    if should_sync_git:
         git_result = init_git_repository(
             project_root,
             branch=str(branch or "main"),
-            remote_url=(getattr(args, "remote_url", None) or "").strip() or None,
+            remote_url=remote_url_arg,
         )
         payload["git"] = git_result
         payload["warnings"].extend(git_result.get("warnings") or [])
@@ -2256,8 +2415,13 @@ def init_command(args: argparse.Namespace) -> int:
     if git_result:
         print(f"Git:                  {'инициализирован' if git_result.get('initialized') else 'ошибка'}")
         print(f"Ветка:                {git_result.get('branch') or branch or 'неизвестно'}")
+        print(f"Операция Git:         {git_result.get('operation') or 'нет'}")
+        operations = git_result.get('operations') or []
+        if operations:
+            print(f"Git-шаги:             {', '.join(str(item) for item in operations)}")
         if git_result.get("remoteUrl"):
             print(f"Remote origin:        {git_result.get('remoteUrl')}")
+            print(f"Remote синхронизирован: {git_result.get('synced')}")
     if not project_root.exists():
         print("Предупреждение: каталог проекта пока не существует. Создайте его перед запуском start.")
     for warning in payload.get("warnings") or []:
@@ -2489,7 +2653,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--create-project", action="store_true", help="Создать каталог проекта, если его ещё нет")
     init.add_argument("--git-init", action="store_true", help="Инициализировать локальный Git-репозиторий в каталоге проекта")
     init.add_argument("--branch", default=None, help="Имя основной ветки для нового Git-репозитория, например main")
-    init.add_argument("--remote-url", default=None, help="Необязательный URL GitHub/Git remote для origin")
+    init.add_argument("--remote-url", default=None, help="Необязательный URL GitHub/Git remote для origin; при указании project/ будет клонирован или синхронизирован через fetch/pull")
 
     status = subparsers.add_parser("status", help="Показать состояние рабочей области/Git/патчей без изменений")
     status.add_argument("--json", action="store_true", help="Вывести машинно-читаемый JSON")

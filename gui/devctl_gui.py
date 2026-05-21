@@ -17,7 +17,7 @@ except ImportError:  # запуск как python -m gui.devctl_gui
     from .devctl_runner import DevctlRunner, RunResult  # type: ignore
 
 APP_NAME = "devctl GUI"
-APP_VERSION = "0.1.5"
+APP_VERSION = "0.1.6"
 
 
 PATCH_PROMPT_TEMPLATE = """Ты работаешь с devctl workspace и должен вернуть не полный архив проекта, а полноценный devctl-патч.
@@ -292,7 +292,7 @@ class InitWorkspaceDialog(tk.Toplevel):
         ttk.Label(body, text="Новый workspace", font=("Segoe UI", 13, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
         ttk.Label(
             body,
-            text="GUI создаст папку workspace, структуру devctl и локальный Git-репозиторий в project/.",
+            text="GUI создаст папку workspace и структуру devctl. Если указан GitHub/Git URL, project/ будет клонирован или синхронизирован через fetch/pull.",
             wraplength=560,
         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 14))
 
@@ -307,11 +307,17 @@ class InitWorkspaceDialog(tk.Toplevel):
         ttk.Label(body, text="GitHub/Git remote URL для origin, необязательно:").grid(row=6, column=0, sticky="w")
         ttk.Entry(body, textvariable=self.remote_var, width=62).grid(row=7, column=0, columnspan=3, sticky="ew", pady=(4, 10))
 
-        ttk.Label(body, text="Основная ветка:").grid(row=8, column=0, sticky="w")
-        ttk.Entry(body, textvariable=self.branch_var, width=20).grid(row=9, column=0, sticky="w", pady=(4, 16))
+        ttk.Label(
+            body,
+            text="Если URL задан, GUI загрузит существующий remote-проект в project/ и явно выполнит fetch/pull выбранной ветки.",
+            wraplength=560,
+        ).grid(row=8, column=0, columnspan=3, sticky="w", pady=(0, 10))
+
+        ttk.Label(body, text="Основная ветка:").grid(row=9, column=0, sticky="w")
+        ttk.Entry(body, textvariable=self.branch_var, width=20).grid(row=10, column=0, sticky="w", pady=(4, 16))
 
         buttons = ttk.Frame(body)
-        buttons.grid(row=10, column=0, columnspan=3, sticky="e")
+        buttons.grid(row=11, column=0, columnspan=3, sticky="e")
         ttk.Button(buttons, text="Отмена", command=self.cancel).pack(side="right")
         ttk.Button(buttons, text="Создать и открыть", command=self.accept).pack(side="right", padx=(0, 8))
 
@@ -831,11 +837,19 @@ class DevctlGui(tk.Tk):
             f"Ветка: {git_data.get('branch') or 'неизвестно'}",
             f"Remote origin: {git_data.get('remoteUrl') or 'не задан'}",
             f"Remote связан: {git_data.get('remoteLinked')}",
+            f"Операция: {git_data.get('operation') or 'нет'}",
+            f"Синхронизация remote: {git_data.get('synced')}",
+            f"Pull выполнен: {git_data.get('pulled')}",
+            f"Pull пропущен: {git_data.get('pullSkipped')}",
             "",
             "== создано ==",
         ]
         created = data.get("created") or []
         lines.extend([f"- {item}" for item in created] or ["всё уже существовало"])
+        operations = git_data.get("operations") if isinstance(git_data, dict) else []
+        lines.append("")
+        lines.append("== git-шаги ==")
+        lines.extend([f"- {item}" for item in operations] or ["нет"])
         warnings = data.get("warnings") or []
         lines.append("")
         lines.append("== предупреждения ==")
