@@ -30,7 +30,10 @@
       ".env.*",
       "*.sqlite",
       "*.sqlite3",
-      "*.db"
+      "*.db",
+      "UserTestSpace",
+      "*.pyc",
+      "*.pyo"
     ]
   },
   "checkProfiles": {
@@ -42,5 +45,6 @@
     "referenceWrapper": "archives/reference/zapret2_strategy_wrapper.py",
     "rule": "Каждое будущее изменение проекта должно приходить zip-патчем в patches/ и явно описывать согласование с исходным якорем zapret-main.zip.",
     "sourceAnchorNote": "Источник правды для продукта; патчи должны объяснять, как они соотносятся с этим архивом."
-  }
+  },
+  "userTestSpaceDir": "UserTestSpace"
 }

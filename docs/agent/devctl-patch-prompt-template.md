@@ -6,10 +6,11 @@
 Ты работаешь с devctl workspace и должен вернуть не полный архив проекта, а полноценный devctl-патч.
 
 Контекст devctl:
-- workspace содержит project/, patches/, archives/ и .devctl/;
+- workspace содержит project/, patches/, archives/, UserTestSpace/ и .devctl/;
 - devctl применяет patch.zip из patches/ к папке project/;
 - патч должен быть безопасным, воспроизводимым и понятным человеку;
 - GUI/CLI ожидают структуру patch.zip с manifest.json, PATCH_SUMMARY.md и files/.
+- devctl умеет reset, init --upgrade, автооткат failed start, UTS и автоочистку Python bytecode/cache.
 
 Твоя задача:
 1. Изучи текущие файлы проекта, которые нужно менять. Не придумывай содержимое вслепую.
@@ -29,7 +30,7 @@ patch_YYYYMMDD_HHMMSS_short_slug.zip
 Правила для files/:
 - пути внутри files/ должны быть относительными к project/;
 - не клади абсолютные пути;
-- не клади .git/, .env, секреты, __pycache__/, *.pyc, .venv/, dist/, build/, node_modules/;
+- не клади .git/, .env, секреты, __pycache__/, *.pyc, *.pyo, .pytest_cache/, .venv/, dist/, build/, node_modules/;
 - если devctl копирует целые файлы, клади в files/ уже финальные версии изменённых файлов;
 - не меняй unrelated-файлы ради косметики.
 

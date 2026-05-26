@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-devctl v0.5.1 — проектно-независимый конвейер применения ИИ-патчей на чистом Python.
+devctl v0.6.2 — проектно-независимый конвейер применения ИИ-патчей на чистом Python.
 
 Базовый поток конвейера: применить патч -> выполнить проверки -> создать коммит -> отправить в remote.
 
@@ -10,6 +10,7 @@ devctl v0.5.1 — проектно-независимый конвейер пр�
     python tools/devctl.py inspect
     python tools/devctl.py plan
     python tools/devctl.py start
+    python tools/devctl.py reset
 
 Инструмент намеренно использует только стандартную библиотеку Python.
 """
@@ -31,11 +32,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-DEVCTL_VERSION = "0.5.1"
+DEVCTL_VERSION = "0.6.2"
 STATE_VERSION = 1
 DEFAULT_PROJECT_DIR_NAME = "project"
 DEFAULT_PATCHES_DIR_NAME = "patches"
 DEFAULT_ARCHIVES_DIR_NAME = "archives"
+DEFAULT_UTS_DIR_NAME = "UserTestSpace"
 DEVCTL_WORKSPACE_ENV = "DEVCTL_WORKSPACE"
 DEVCTL_COMMAND_NAME = "devctl"
 LEGACY_ARCHIVES_DIR_ALIASES = ("arhives",)
@@ -54,6 +56,7 @@ ARCHIVE_EXCLUDED_PARTS = {
     "patches",
     "archives",
     "arhives",
+    "UserTestSpace",
     "__pycache__",
 }
 ARCHIVE_EXCLUDED_SUFFIXES = (".db", ".sqlite", ".sqlite3")
@@ -64,7 +67,9 @@ RELEASE_ZIP_PLACEHOLDER = "тут_был_zip_архив.txt"
 RELEASE_EXE_PLACEHOLDER = "тут_был_экзешник.txt"
 ARCHIVE_SIZE_WARNING_BYTES = 100 * 1024 * 1024
 DANGEROUS_GIT_PATH_SUFFIXES = ARCHIVE_EXCLUDED_SUFFIXES + (".pyc", ".pyo")
-DANGEROUS_GIT_PATH_PARTS = {"node_modules", "target", ".git", "__pycache__", "patches", "archives", "arhives"}
+DANGEROUS_GIT_PATH_PARTS = {"node_modules", "target", ".git", "__pycache__", "patches", "archives", "arhives", "UserTestSpace"}
+PYTHON_BYTECODE_DIR_NAMES = {"__pycache__"}
+PYTHON_BYTECODE_SUFFIXES = (".pyc", ".pyo")
 
 
 class DevctlError(Exception):
@@ -135,6 +140,7 @@ class Workspace:
     workspace_root: Path
     patches_dir: Path
     archives_dir: Path
+    uts_dir: Path
     state_dir: Path
     state_file: Path
 
@@ -171,6 +177,19 @@ class RunContext:
     git_status_after_checks: str = ""
     changes_introduced_by_checks: list[str] = field(default_factory=list)
     archive_size_warnings: list[str] = field(default_factory=list)
+    ignored_bytecode_files: list[str] = field(default_factory=list)
+    cleaned_bytecode_paths: list[str] = field(default_factory=list)
+    bytecode_cleanup_error: str | None = None
+    auto_reset_performed: bool = False
+    auto_reset_target: str | None = None
+    auto_reset_clean_mode: str | None = None
+    auto_reset_error: str | None = None
+    git_status_after_reset: str = ""
+    bad_patch_deleted: str | None = None
+    bad_patch_delete_error: str | None = None
+    uts_dir: Path | None = None
+    uts_project_dir: Path | None = None
+    uts_error: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -397,12 +416,19 @@ def discover_workspace_from_config(config_path: Path) -> Workspace:
         default=DEFAULT_ARCHIVES_DIR_NAME,
         key="archivesDir",
     )
+    uts_dir = resolve_workspace_path(
+        workspace_root,
+        config.get("userTestSpaceDir"),
+        default=DEFAULT_UTS_DIR_NAME,
+        key="userTestSpaceDir",
+    )
     state_dir = workspace_root / ".devctl"
     return Workspace(
         project_root=project_root,
         workspace_root=workspace_root,
         patches_dir=patches_dir,
         archives_dir=archives_dir,
+        uts_dir=uts_dir,
         state_dir=state_dir,
         state_file=state_dir / "state.json",
     )
@@ -439,6 +465,7 @@ def fallback_workspace_for_project(project_root: Path) -> Workspace:
         workspace_root=workspace_root.resolve(),
         patches_dir=patches_dir.resolve(),
         archives_dir=archives_dir.resolve(),
+        uts_dir=(workspace_root / DEFAULT_UTS_DIR_NAME).resolve(),
         state_dir=state_dir.resolve(),
         state_file=(state_dir / "state.json").resolve(),
     )
@@ -477,6 +504,7 @@ def discover_workspace_from_override(raw: str) -> Workspace:
             workspace_root=candidate.resolve(),
             patches_dir=(candidate / DEFAULT_PATCHES_DIR_NAME).resolve(),
             archives_dir=archives_dir.resolve(),
+            uts_dir=(candidate / DEFAULT_UTS_DIR_NAME).resolve(),
             state_dir=state_dir.resolve(),
             state_file=(state_dir / "state.json").resolve(),
         )
@@ -830,6 +858,107 @@ def git_status_short(project_root: Path) -> str:
     return result.stdout.strip()
 
 
+def git_reset_hard(project_root: Path, target: str = "HEAD") -> CommandResult:
+    return git(project_root, ["reset", "--hard", target], timeout=180)
+
+
+def git_clean(project_root: Path, mode: str = "fd") -> CommandResult:
+    if mode not in {"fd", "fdx"}:
+        raise DevctlError(f"clean-mode должен быть fd или fdx, получено: {mode!r}")
+    return git(project_root, ["clean", f"-{mode}"], timeout=180)
+
+
+def reset_workspace_project(workspace: Workspace, *, target: str = "HEAD", clean_mode: str = "fd") -> dict[str, Any]:
+    if not git_available():
+        raise DevctlError("команда git не найдена")
+    if not (workspace.project_root / ".git").exists():
+        raise DevctlError(f"Корень проекта не является Git-репозиторием: {workspace.project_root}")
+    status_before = git_status_porcelain(workspace.project_root)
+    reset_result = git_reset_hard(workspace.project_root, target)
+    if reset_result.returncode != 0:
+        raise DevctlError("git reset --hard завершился ошибкой: " + (reset_result.stderr.strip() or reset_result.stdout.strip()))
+    clean_result = git_clean(workspace.project_root, clean_mode)
+    if clean_result.returncode != 0:
+        raise DevctlError("git clean завершился ошибкой: " + (clean_result.stderr.strip() or clean_result.stdout.strip()))
+    status_after = git_status_porcelain(workspace.project_root)
+    return {
+        "target": target,
+        "cleanMode": clean_mode,
+        "gitStatusBefore": status_before,
+        "gitStatusAfter": status_after,
+        "resetStdout": reset_result.stdout,
+        "cleanStdout": clean_result.stdout,
+    }
+
+
+def safe_patch_path(workspace: Workspace, raw: str) -> Path:
+    text = str(raw or "").strip()
+    if not text:
+        raise DevctlError("Путь патча пуст")
+    candidate = expand_user_path(text)
+    if not candidate.is_absolute():
+        candidate = workspace.patches_dir / candidate
+    resolved = candidate.resolve()
+    patches_root = workspace.patches_dir.resolve()
+    try:
+        resolved.relative_to(patches_root)
+    except ValueError as exc:
+        raise DevctlError(f"Отказ удалить патч вне patches/: {resolved}") from exc
+    if resolved.suffix.lower() != ".zip":
+        raise DevctlError(f"Отказ удалить не-zip файл как патч: {resolved.name}")
+    if not resolved.is_file():
+        raise DevctlError(f"Файл патча не найден: {resolved}")
+    return resolved
+
+
+def delete_patch_file(path: Path, workspace: Workspace | None = None) -> str:
+    path.unlink()
+    if workspace is not None:
+        return rel_display(path, workspace.workspace_root)
+    return str(path)
+
+
+def latest_failed_patch_path(workspace: Workspace, state: dict[str, Any]) -> Path | None:
+    run = latest_failed_run(state)
+    if not run:
+        return None
+    patch_file = run.get("patchFile")
+    if not isinstance(patch_file, str) or not patch_file.strip():
+        return None
+    try:
+        return safe_patch_path(workspace, patch_file)
+    except DevctlError:
+        return None
+
+
+def maybe_delete_patch_for_context(ctx: RunContext) -> None:
+    try:
+        ctx.bad_patch_deleted = delete_patch_file(safe_patch_path(ctx.workspace, ctx.patch.path.name), ctx.workspace)
+    except Exception as exc:
+        ctx.bad_patch_delete_error = str(exc)
+
+
+def auto_reset_after_failed_start(ctx: RunContext, *, delete_bad_patch: bool = True, target: str = "HEAD", clean_mode: str = "fd") -> None:
+    if not ctx.applied_started:
+        return
+    if ctx.commit_sha or ctx.status == "push_failed":
+        ctx.warnings.append("Auto-reset пропущен: локальный commit уже создан или ошибка относится к push.")
+        return
+    ctx.auto_reset_target = target
+    ctx.auto_reset_clean_mode = clean_mode
+    try:
+        reset_info = reset_workspace_project(ctx.workspace, target=target, clean_mode=clean_mode)
+        ctx.auto_reset_performed = True
+        ctx.git_status_after_reset = str(reset_info.get("gitStatusAfter") or "")
+        if ctx.logs_dir:
+            write_log(ctx, "git-status-after-auto-reset.log", ctx.git_status_after_reset)
+        if delete_bad_patch:
+            maybe_delete_patch_for_context(ctx)
+    except Exception as exc:
+        ctx.auto_reset_error = str(exc)
+        ctx.warnings.append(f"Auto-reset не удалось выполнить: {exc}")
+
+
 def fetch_remote(project_root: Path, remote: str) -> None:
     result = git(project_root, ["fetch", "--prune", remote], timeout=180)
     if result.returncode != 0:
@@ -1047,8 +1176,17 @@ def validate_patch_files_root(candidate: PatchCandidate, manifest: dict[str, Any
     except Exception as exc:
         raise InvalidPatchError(f"Не удалось проверить zip-архив патча: {exc}") from exc
     file_entries = [name for name in names if name != files_root and name.startswith(prefix) and not name.endswith("/")]
+    actionable_file_entries = []
+    for name in file_entries:
+        relative = name[len(prefix) :]
+        if not is_python_bytecode_artifact(relative):
+            actionable_file_entries.append(name)
     delete_entries = manifest.get("apply", {}).get("delete", [])
-    if not file_entries and not delete_entries:
+    if not actionable_file_entries and not delete_entries:
+        if file_entries:
+            raise InvalidPatchError(
+                f"В патче внутри {files_root!r} есть только Python bytecode/cache, который devctl игнорирует"
+            )
         raise InvalidPatchError(f"В патче нет файлов внутри {files_root!r} и нет записей на удаление")
     for name in names:
         if "\\" in name:
@@ -1092,6 +1230,65 @@ def should_exclude_from_archive(relative_posix: str, extra_excludes: Iterable[st
         if fnmatch.fnmatch(relative_posix, normalized):
             return True
     return False
+
+
+def is_python_bytecode_artifact(relative_posix: str) -> bool:
+    normalized = relative_posix.replace("\\", "/").strip("/")
+    if not normalized:
+        return False
+    parts = [part for part in normalized.split("/") if part]
+    if any(part in PYTHON_BYTECODE_DIR_NAMES for part in parts):
+        return True
+    return normalized.lower().endswith(PYTHON_BYTECODE_SUFFIXES)
+
+
+def clean_python_bytecode_artifacts(project_root: Path) -> list[str]:
+    """Delete Python bytecode/cache artifacts from the project tree.
+
+    This is intentionally conservative: only __pycache__ directories and
+    .pyc/.pyo files are removed, using pathlib/shutil only so it works on
+    Windows, Linux and macOS.
+    """
+    removed: list[str] = []
+    if not project_root.exists():
+        return removed
+
+    cache_dirs: list[Path] = []
+    bytecode_files: list[Path] = []
+    for root, dirs, files in os.walk(project_root):
+        root_path = Path(root)
+        for directory in dirs:
+            if directory in PYTHON_BYTECODE_DIR_NAMES:
+                cache_dirs.append(root_path / directory)
+        for filename in files:
+            if filename.lower().endswith(PYTHON_BYTECODE_SUFFIXES):
+                bytecode_files.append(root_path / filename)
+
+    for path in sorted(cache_dirs, key=lambda item: len(item.parts), reverse=True):
+        if path.exists():
+            shutil.rmtree(path)
+            removed.append(rel_display(path, project_root))
+
+    for path in sorted(bytecode_files):
+        if path.exists():
+            path.unlink()
+            removed.append(rel_display(path, project_root))
+
+    return sorted(set(removed))
+
+
+def clean_python_bytecode_for_start(ctx: RunContext, phase: str) -> None:
+    try:
+        removed = clean_python_bytecode_artifacts(ctx.workspace.project_root)
+    except Exception as exc:
+        ctx.bytecode_cleanup_error = str(exc)
+        ctx.warnings.append(f"Не удалось очистить Python bytecode/cache после этапа {phase}: {exc}")
+        return
+    if removed:
+        ctx.cleaned_bytecode_paths.extend(removed)
+        ctx.warnings.append(
+            f"Автоочистка Python bytecode/cache после этапа {phase}: удалено {len(removed)} объект(ов)."
+        )
 
 
 def unique_path(path: Path) -> Path:
@@ -1242,6 +1439,78 @@ def create_project_archive(
     return destination, file_count
 
 
+def validate_zip_member_for_extract(name: str) -> tuple[str, ...]:
+    if not name or name.endswith("/"):
+        return tuple()
+    normalized = name.replace("\\", "/")
+    if "\\" in name:
+        raise DevctlError(f"Zip entry содержит backslash: {name!r}")
+    if normalized.startswith("/") or normalized.startswith("//"):
+        raise DevctlError(f"Zip entry является абсолютным или UNC-подобным: {name!r}")
+    parts = tuple(part for part in normalized.split("/") if part)
+    if not parts:
+        return tuple()
+    if any(part in {".", ".."} for part in parts):
+        raise DevctlError(f"Zip entry содержит небезопасный сегмент: {name!r}")
+    if ":" in parts[0]:
+        raise DevctlError(f"Zip entry начинается с сегмента, похожего на диск: {name!r}")
+    return parts
+
+
+def safe_extract_zip(zip_path: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    dest_resolved = destination.resolve()
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for info in zf.infolist():
+            parts = validate_zip_member_for_extract(info.filename)
+            if not parts:
+                continue
+            target = (dest_resolved / Path(*parts)).resolve()
+            try:
+                target.relative_to(dest_resolved)
+            except ValueError as exc:
+                raise DevctlError(f"Zip entry выходит за пределы каталога назначения: {info.filename!r}") from exc
+            if info.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(info, "r") as source, target.open("wb") as out:
+                shutil.copyfileobj(source, out)
+
+
+def populate_user_test_space(ctx: RunContext) -> None:
+    if not ctx.post_archive:
+        return
+    uts_dir = ctx.workspace.uts_dir
+    ctx.uts_dir = uts_dir
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    slug = slugify(
+        (ctx.manifest.get("archive") if isinstance(ctx.manifest.get("archive"), dict) else {}).get("nameSlug")
+        or ctx.manifest.get("patchId")
+    )
+    version_dir = unique_path(uts_dir / f"project_{timestamp}_after_{slug}_{short_sha(ctx.commit_sha or ctx.patch.sha256)}")
+    tmp_dir = unique_path(uts_dir / f".tmp_{version_dir.name}")
+    try:
+        uts_dir.mkdir(parents=True, exist_ok=True)
+        safe_extract_zip(ctx.post_archive, tmp_dir)
+        entries = [path for path in tmp_dir.iterdir()] if tmp_dir.exists() else []
+        project_dir = version_dir / "project"
+        project_dir.parent.mkdir(parents=True, exist_ok=True)
+        if len(entries) == 1 and entries[0].is_dir():
+            shutil.move(str(entries[0]), str(project_dir))
+        else:
+            project_dir.mkdir(parents=True, exist_ok=False)
+            for entry in entries:
+                shutil.move(str(entry), str(project_dir / entry.name))
+        ctx.uts_project_dir = project_dir
+    except Exception as exc:
+        ctx.uts_error = str(exc)
+        ctx.warnings.append(f"Не удалось развернуть User Test Space: {exc}")
+    finally:
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def archive_name(project: str, timestamp: str, phase: str, slug: str, suffix: str = "") -> str:
     extra = f"_{suffix}" if suffix else ""
     return f"{phase}_{project}_{timestamp}_{slug}{extra}.zip"
@@ -1311,6 +1580,9 @@ def safe_copy_files(ctx: RunContext) -> None:
             parts = rel.split("/")
             if parts[0] == ".git" or ".git" in parts:
                 raise InvalidPatchError(f"Отказ копировать путь .git: {rel}")
+            if is_python_bytecode_artifact(rel):
+                ctx.ignored_bytecode_files.append(rel)
+                continue
             if parts[-1] == ".env" or parts[-1].startswith(".env."):
                 raise InvalidPatchError(f"Отказ копировать env-файл, похожий на секрет: {rel}")
             destination = safe_destination(project_root, rel, kind=f"zip entry {name!r}")
@@ -1520,6 +1792,18 @@ def report_lines(ctx: RunContext, finished_at: datetime) -> list[str]:
         lines.append(f"  - `{path}`\n")
     if len(ctx.deleted_paths) > 200:
         lines.append(f"  - ... ещё {len(ctx.deleted_paths) - 200}\n")
+    lines.append(f"- Проигнорировано Python bytecode/cache из patch payload: {len(ctx.ignored_bytecode_files)}\n")
+    for path in ctx.ignored_bytecode_files[:200]:
+        lines.append(f"  - `{path}`\n")
+    if len(ctx.ignored_bytecode_files) > 200:
+        lines.append(f"  - ... ещё {len(ctx.ignored_bytecode_files) - 200}\n")
+    lines.append(f"- Автоочистка Python bytecode/cache в project: {len(set(ctx.cleaned_bytecode_paths))}\n")
+    for path in sorted(set(ctx.cleaned_bytecode_paths))[:200]:
+        lines.append(f"  - `{path}`\n")
+    if len(set(ctx.cleaned_bytecode_paths)) > 200:
+        lines.append(f"  - ... ещё {len(set(ctx.cleaned_bytecode_paths)) - 200}\n")
+    if ctx.bytecode_cleanup_error:
+        lines.append(f"- Ошибка очистки Python bytecode/cache: `{ctx.bytecode_cleanup_error}`\n")
     lines.append("\n## Снимки статуса Git\n\n")
     lines.append("### Изменения после применения\n\n")
     lines.append("```text\n" + (ctx.git_status_after_apply or "<пусто>\n") + "```\n\n")
@@ -1549,6 +1833,21 @@ def report_lines(ctx: RunContext, finished_at: datetime) -> list[str]:
         lines.append("\n### Предупреждения по архивам\n\n")
         for warning in ctx.archive_size_warnings:
             lines.append(f"- {warning}\n")
+    lines.append("\n## Auto reset\n\n")
+    lines.append(f"- Выполнен: `{'да' if ctx.auto_reset_performed else 'нет'}`\n")
+    lines.append(f"- Цель reset: `{ctx.auto_reset_target or 'нет'}`\n")
+    lines.append(f"- Clean mode: `{ctx.auto_reset_clean_mode or 'нет'}`\n")
+    lines.append(f"- Статус после reset: `{'clean' if ctx.auto_reset_performed and not ctx.git_status_after_reset.strip() else ('not clean' if ctx.auto_reset_performed else 'нет')}`\n")
+    lines.append(f"- Удалённый плохой патч: `{ctx.bad_patch_deleted or 'нет'}`\n")
+    lines.append(f"- Ошибка auto-reset: `{ctx.auto_reset_error or 'нет'}`\n")
+    lines.append(f"- Ошибка удаления патча: `{ctx.bad_patch_delete_error or 'нет'}`\n")
+    if ctx.git_status_after_reset:
+        lines.append("\n### Изменения после auto-reset\n\n")
+        lines.append("```text\n" + ctx.git_status_after_reset + "```\n")
+    lines.append("\n## User Test Space\n\n")
+    lines.append(f"- Каталог UTS: `{rel_display(ctx.workspace.uts_dir, ctx.workspace.workspace_root)}` {'[нет]' if not ctx.workspace.uts_dir.exists() else ''}\n")
+    lines.append(f"- Развёрнутая версия: `{rel_display(ctx.uts_project_dir, ctx.workspace.workspace_root) if ctx.uts_project_dir else 'нет'}`\n")
+    lines.append(f"- Ошибка UTS: `{ctx.uts_error or 'нет'}`\n")
     lines.append("\n## Commit / push\n\n")
     lines.append("- Политика конвейера по умолчанию: `проверки -> commit -> push`\n")
     lines.append(f"- Push включён: `{ctx.push_enabled}`\n")
@@ -1571,15 +1870,18 @@ def report_lines(ctx: RunContext, finished_at: datetime) -> list[str]:
     if ctx.status in {"failed", "push_failed", "interrupted"}:
         lines.append("\n## Восстановление\n\n")
         if ctx.applied_started:
-            lines.append("Рабочее дерево оставлено с изменениями для инспекции. Архив состояния ошибки должен существовать, если его удалось создать.\n\n")
-            lines.append("```bash\n")
-            lines.append("git status\n")
-            lines.append("git diff\n")
-            lines.append("# Осторожно: следующие команды откатывают локальные изменения.\n")
-            lines.append("git reset --hard HEAD\n")
-            lines.append("# Осторожно: удаляет untracked файлы/каталоги.\n")
-            lines.append("git clean -fd\n")
-            lines.append("```\n")
+            if ctx.auto_reset_performed:
+                lines.append("Рабочее дерево автоматически откатилось после ошибки. Архив состояния ошибки создан до auto-reset, если это было возможно.\n")
+            else:
+                lines.append("Рабочее дерево могло остаться с изменениями для инспекции. Архив состояния ошибки должен существовать, если его удалось создать.\n\n")
+                lines.append("```bash\n")
+                lines.append("git status\n")
+                lines.append("git diff\n")
+                lines.append("# Осторожно: следующие команды откатывают локальные изменения.\n")
+                lines.append("git reset --hard HEAD\n")
+                lines.append("# Осторожно: удаляет untracked файлы/каталоги.\n")
+                lines.append("git clean -fd\n")
+                lines.append("```\n")
         elif ctx.status == "push_failed":
             lines.append("Коммит создан локально, но push не прошёл. Выполните `git status -sb` и push вручную после устранения причины.\n")
         else:
@@ -1610,6 +1912,17 @@ def update_state_from_context(ctx: RunContext) -> None:
         "commitSha": ctx.commit_sha,
         "archiveDir": rel_display(ctx.run_dir, ctx.workspace.workspace_root) if ctx.run_dir else None,
         "report": rel_display(ctx.report_path, ctx.workspace.workspace_root) if ctx.report_path else None,
+        "autoResetPerformed": ctx.auto_reset_performed,
+        "autoResetTarget": ctx.auto_reset_target,
+        "autoResetCleanMode": ctx.auto_reset_clean_mode,
+        "autoResetError": ctx.auto_reset_error,
+        "badPatchDeleted": ctx.bad_patch_deleted,
+        "badPatchDeleteError": ctx.bad_patch_delete_error,
+        "utsProjectDir": rel_display(ctx.uts_project_dir, ctx.workspace.workspace_root) if ctx.uts_project_dir else None,
+        "utsError": ctx.uts_error,
+        "ignoredBytecodeFiles": ctx.ignored_bytecode_files,
+        "cleanedBytecodePaths": sorted(set(ctx.cleaned_bytecode_paths)),
+        "bytecodeCleanupError": ctx.bytecode_cleanup_error,
     }
     append_run_state(ctx.workspace, record)
 
@@ -1643,11 +1956,13 @@ def workspace_to_json(workspace: Workspace) -> dict[str, Any]:
         "workspaceRoot": path_text(workspace.workspace_root),
         "patchesDir": path_text(workspace.patches_dir),
         "archivesDir": path_text(workspace.archives_dir),
+        "userTestSpaceDir": path_text(workspace.uts_dir),
         "stateDir": path_text(workspace.state_dir),
         "stateFile": path_text(workspace.state_file),
         "projectExists": workspace.project_root.exists(),
         "patchesDirExists": workspace.patches_dir.is_dir(),
         "archivesDirExists": workspace.archives_dir.is_dir(),
+        "userTestSpaceDirExists": workspace.uts_dir.is_dir(),
         "stateFileExists": workspace.state_file.exists(),
     }
 
@@ -1742,6 +2057,7 @@ def build_status_payload(workspace_arg: str | None = None) -> tuple[dict[str, An
         "ok": True,
         "version": DEVCTL_VERSION,
         "workspace": workspace_to_json(workspace),
+        "workspaceConfig": workspace_config_upgrade_status(workspace),
         "git": git_status_to_json(workspace),
         "patches": {"count": 0, "latest": None, "items": []},
         "state": {
@@ -1796,6 +2112,16 @@ def status_command(args: argparse.Namespace | None = None) -> int:
     print(f"Корень рабочей области: {workspace.workspace_root}")
     print(f"Каталог патчей:        {workspace.patches_dir} {'[нет]' if not workspace.patches_dir.is_dir() else ''}")
     print(f"Каталог архивов:       {workspace.archives_dir} {'[нет]' if not workspace.archives_dir.is_dir() else ''}")
+    print(f"Каталог UTS:           {workspace.uts_dir} {'[нет]' if not workspace.uts_dir.is_dir() else ''}")
+    config_status = workspace_config_upgrade_status(workspace)
+    if config_status.get("upgradeAvailable"):
+        print("Конфигурация workspace: рекомендуется `devctl init --upgrade`")
+        missing = []
+        missing.extend(config_status.get("missingFields") or [])
+        missing.extend(config_status.get("missingArchiveExcludes") or [])
+        missing.extend(config_status.get("missingDirs") or [])
+        if missing:
+            print(f"Нужно добавить/создать: {', '.join(str(item) for item in missing)}")
 
     print_header("git")
     if not git_available():
@@ -1861,6 +2187,68 @@ def status_command(args: argparse.Namespace | None = None) -> int:
     return 0
 
 
+def reset_command(args: argparse.Namespace) -> int:
+    json_enabled = bool(getattr(args, "json", False))
+    payload: dict[str, Any] = {"ok": False, "version": DEVCTL_VERSION, "status": "reset_failed"}
+    try:
+        workspace = discover_workspace(workspace_arg_from_namespace(args))
+        target = str(getattr(args, "target", "HEAD") or "HEAD")
+        clean_mode = str(getattr(args, "clean_mode", "fd") or "fd")
+        state = load_state(workspace)
+        patch_deleted: str | None = None
+        patch_delete_error: str | None = None
+
+        reset_info = reset_workspace_project(workspace, target=target, clean_mode=clean_mode)
+
+        if not bool(getattr(args, "keep_patch", False)):
+            explicit_patch = getattr(args, "delete_patch", None)
+            patch_path = safe_patch_path(workspace, explicit_patch) if explicit_patch else latest_failed_patch_path(workspace, state)
+            if patch_path is not None:
+                try:
+                    patch_deleted = delete_patch_file(patch_path, workspace)
+                except Exception as exc:
+                    patch_delete_error = str(exc)
+
+        status_after = str(reset_info.get("gitStatusAfter") or "")
+        payload.update(
+            {
+                "ok": True,
+                "status": "reset",
+                "workspace": workspace_to_json(workspace),
+                "target": target,
+                "cleanMode": clean_mode,
+                "patchDeleted": patch_deleted,
+                "patchDeleteError": patch_delete_error,
+                "gitStatusBefore": reset_info.get("gitStatusBefore"),
+                "gitStatusAfter": status_after,
+            }
+        )
+
+        print_header("devctl reset")
+        print(f"Проект:        {workspace.project_root}")
+        print(f"Цель reset:    {target}")
+        print("Git reset:     ok")
+        print(f"Git clean:     ok (-{clean_mode})")
+        if patch_deleted:
+            print(f"Плохой патч:   {patch_deleted} удалён")
+        elif patch_delete_error:
+            print(f"Плохой патч:   ошибка удаления: {patch_delete_error}")
+        elif bool(getattr(args, "keep_patch", False)):
+            print("Плохой патч:   сохранён (--keep-patch)")
+        else:
+            print("Плохой патч:   не найден для auto-удаления")
+        print("Статус Git:    clean" if not status_after.strip() else "Статус Git:    есть изменения")
+        maybe_emit_json(json_enabled, payload)
+        return 0
+    except DevctlError as exc:
+        payload["error"] = str(exc)
+        if json_enabled:
+            emit_json(payload)
+        else:
+            print(f"[ОШИБКА] {exc}")
+        return 2
+
+
 def latest_archive_dir(workspace: Workspace) -> str | None:
     if not workspace.archives_dir.is_dir():
         return None
@@ -1889,9 +2277,15 @@ def start_result_payload(
             "archivePath": None,
             "commitSha": None,
             "pushResult": None,
+            "autoResetPerformed": False,
+            "badPatchDeleted": None,
+            "utsProjectDir": None,
             "patch": None,
             "errors": [] if not message else [message] if returncode else [],
             "warnings": [],
+            "ignoredBytecodeFiles": [],
+            "cleanedBytecodePaths": [],
+            "bytecodeCleanupError": None,
         }
     return {
         "ok": returncode == 0 and ctx.status in {"applied", "running", "noop"},
@@ -1907,8 +2301,19 @@ def start_result_payload(
         "pushEnabled": ctx.push_enabled,
         "pushRemote": ctx.push_remote,
         "pushBranch": ctx.push_branch,
+        "autoResetPerformed": ctx.auto_reset_performed,
+        "autoResetTarget": ctx.auto_reset_target,
+        "autoResetCleanMode": ctx.auto_reset_clean_mode,
+        "autoResetError": ctx.auto_reset_error,
+        "badPatchDeleted": ctx.bad_patch_deleted,
+        "badPatchDeleteError": ctx.bad_patch_delete_error,
+        "utsProjectDir": path_text(ctx.uts_project_dir),
+        "utsError": ctx.uts_error,
         "copiedFiles": ctx.copied_files,
         "deletedPaths": ctx.deleted_paths,
+        "ignoredBytecodeFiles": ctx.ignored_bytecode_files,
+        "cleanedBytecodePaths": sorted(set(ctx.cleaned_bytecode_paths)),
+        "bytecodeCleanupError": ctx.bytecode_cleanup_error,
         "errors": ctx.errors,
         "warnings": ctx.warnings,
     }
@@ -2009,10 +2414,12 @@ def start_command(args: argparse.Namespace) -> int:
             ctx.applied_started = True
             apply_deletions(ctx)
             safe_copy_files(ctx)
+            clean_python_bytecode_for_start(ctx, "apply")
             ctx.git_status_after_apply = git_status_porcelain(workspace.project_root)
             write_log(ctx, "git-status-after-apply.log", ctx.git_status_after_apply)
 
             run_checks(ctx)
+            clean_python_bytecode_for_start(ctx, "checks")
             ctx.git_status_after_checks = git_status_porcelain(workspace.project_root)
             write_log(ctx, "git-status-after-checks.log", ctx.git_status_after_checks)
             ctx.changes_introduced_by_checks = new_changes_after_checks(
@@ -2033,8 +2440,12 @@ def start_command(args: argparse.Namespace) -> int:
                 failed_name = archive_name(workspace.project_root.name, timestamp, "failed", f"after_failed_{slug}")
                 ctx.failed_archive, _ = create_project_archive(workspace, ctx.run_dir / failed_name, manifest=ctx.manifest)
                 warn_archive_size(ctx, ctx.failed_archive)
+                if ctx.status != "push_failed":
+                    auto_reset_after_failed_start(ctx, delete_bad_patch=not getattr(args, "keep_failed_patch", False))
                 write_report(ctx)
                 update_state_from_context(ctx)
+                if ctx.auto_reset_performed:
+                    print("[AUTO-RESET] Проект автоматически откатан после ошибки; failed-архив сохранён до отката.")
                 print(f"[ОШИБКА] {ctx.status}. Отчёт: {ctx.report_path}")
                 emit_start_json_result(args, ctx, returncode=1)
                 return 1
@@ -2043,6 +2454,7 @@ def start_command(args: argparse.Namespace) -> int:
             post_name = archive_name(workspace.project_root.name, timestamp, "post", f"after_{slug}", gitsha)
             ctx.post_archive, _ = create_project_archive(workspace, ctx.run_dir / post_name, manifest=ctx.manifest)
             warn_archive_size(ctx, ctx.post_archive)
+            populate_user_test_space(ctx)
             ctx.status = "applied"
             write_report(ctx)
             update_state_from_context(ctx)
@@ -2063,6 +2475,8 @@ def start_command(args: argparse.Namespace) -> int:
                 ctx.logs_dir = ctx.run_dir / "logs"
                 ctx.logs_dir.mkdir(parents=True, exist_ok=True)
                 copy_manifest_to_logs(ctx)
+            if ctx.applied_started:
+                auto_reset_after_failed_start(ctx, delete_bad_patch=not getattr(args, "keep_failed_patch", False))
             write_report(ctx)
             update_state_from_context(ctx)
             print(f"[НЕКОРРЕКТНЫЙ ПАТЧ] {exc}")
@@ -2103,8 +2517,11 @@ def start_command(args: argparse.Namespace) -> int:
             failed_name = archive_name(workspace.project_root.name, timestamp, "failed", f"after_failed_{slug}")
             ctx.failed_archive, _ = create_project_archive(workspace, ctx.run_dir / failed_name, manifest=ctx.manifest)
             warn_archive_size(ctx, ctx.failed_archive)
+            auto_reset_after_failed_start(ctx, delete_bad_patch=not getattr(args, "keep_failed_patch", False))
             write_report(ctx)
             update_state_from_context(ctx)
+            if ctx.auto_reset_performed:
+                print("[AUTO-RESET] Проект автоматически откатан после failed checks; failed-архив сохранён до отката.")
             print(f"[ПРОВЕРКА НЕ ПРОШЛА] {exc}")
             print(f"Отчёт: {ctx.report_path}")
             emit_start_json_result(args, ctx, returncode=1)
@@ -2130,6 +2547,10 @@ def start_command(args: argparse.Namespace) -> int:
                 except Exception as exc:
                     ctx_obj.warnings.append(f"Не удалось создать архив состояния после прерывания: {exc}")
             try:
+                if ctx_obj.applied_started and not ctx_obj.commit_sha:
+                    auto_reset_after_failed_start(ctx_obj, delete_bad_patch=not getattr(args, "keep_failed_patch", False))
+                    if ctx_obj.auto_reset_performed:
+                        print("[AUTO-RESET] Проект автоматически откатан после прерывания.")
                 write_report(ctx_obj)
                 update_state_from_context(ctx_obj)
                 print(f"Отчёт: {ctx_obj.report_path}")
@@ -2379,7 +2800,239 @@ def init_git_repository(project_root: Path, *, branch: str | None, remote_url: s
     return result
 
 
+
+def default_git_config(branch: str | None = None) -> dict[str, Any]:
+    config: dict[str, Any] = {
+        "enabled": True,
+        "autoCommit": True,
+        "autoPush": True,
+        "remote": "origin",
+        "requireClean": True,
+        "requireUpToDate": True,
+    }
+    if branch:
+        config["branch"] = str(branch)
+    return config
+
+
+def normalize_workspace_config_for_upgrade(
+    config: dict[str, Any],
+    *,
+    project_dir: str,
+    patches_dir: str,
+    archives_dir: str,
+    uts_dir: str,
+    branch: str | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Non-destructively add fields that new devctl versions expect.
+
+    The function preserves unknown/custom keys and only fills missing defaults or
+    augments archive exclusions. It never rewrites projectDir/patchesDir/etc. when
+    they already exist, which makes `devctl init --upgrade` safe for old workspaces.
+    """
+    upgraded = dict(config)
+    changes: list[str] = []
+
+    def ensure(key: str, value: Any) -> None:
+        if key not in upgraded or upgraded.get(key) in (None, ""):
+            upgraded[key] = value
+            changes.append(key)
+
+    ensure("version", 1)
+    ensure("projectDir", project_dir)
+    ensure("patchesDir", patches_dir)
+    ensure("archivesDir", archives_dir)
+    ensure("userTestSpaceDir", uts_dir)
+
+    git_config = upgraded.get("git")
+    if not isinstance(git_config, dict):
+        upgraded["git"] = default_git_config(branch)
+        changes.append("git")
+
+    archive_config = upgraded.get("archive")
+    if not isinstance(archive_config, dict):
+        archive_config = {}
+        upgraded["archive"] = archive_config
+        changes.append("archive")
+    exclude = archive_config.get("exclude")
+    if not isinstance(exclude, list):
+        exclude = []
+        archive_config["exclude"] = exclude
+        changes.append("archive.exclude")
+    required_excludes = [
+        "UserTestSpace",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        "*.pyc",
+        "*.pyo",
+    ]
+    existing = {str(item) for item in exclude}
+    for item in required_excludes:
+        if item not in existing:
+            exclude.append(item)
+            existing.add(item)
+            changes.append(f"archive.exclude:{item}")
+
+    profiles = upgraded.get("checkProfiles")
+    if not isinstance(profiles, dict):
+        upgraded["checkProfiles"] = {"default": []}
+        changes.append("checkProfiles")
+    elif "default" not in profiles:
+        profiles["default"] = []
+        changes.append("checkProfiles.default")
+
+    return upgraded, changes
+
+
+def workspace_config_upgrade_status(workspace: Workspace) -> dict[str, Any]:
+    config_path = workspace.state_dir / "workspace.json"
+    info: dict[str, Any] = {
+        "path": str(config_path),
+        "exists": config_path.is_file(),
+        "upgradeAvailable": False,
+        "missingFields": [],
+        "missingArchiveExcludes": [],
+        "missingDirs": [],
+        "error": None,
+    }
+    if not config_path.is_file():
+        info["upgradeAvailable"] = True
+        info["missingFields"] = [".devctl/workspace.json"]
+    else:
+        try:
+            config = read_json_file(config_path)
+            if not isinstance(config, dict):
+                raise DevctlError("workspace.json должен быть JSON-объектом")
+            missing_fields = [key for key in ("version", "projectDir", "patchesDir", "archivesDir", "userTestSpaceDir") if key not in config]
+            info["missingFields"] = missing_fields
+            archive = config.get("archive") if isinstance(config.get("archive"), dict) else {}
+            exclude = archive.get("exclude") if isinstance(archive, dict) else []
+            exclude_values = {str(item) for item in exclude} if isinstance(exclude, list) else set()
+            required = ["UserTestSpace", "__pycache__", ".pytest_cache", "*.pyc", "*.pyo"]
+            info["missingArchiveExcludes"] = [item for item in required if item not in exclude_values]
+        except Exception as exc:
+            info["error"] = str(exc)
+            info["upgradeAvailable"] = True
+    dirs = []
+    for label, path in (("patches", workspace.patches_dir), ("archives", workspace.archives_dir), ("UserTestSpace", workspace.uts_dir), (".devctl", workspace.state_dir)):
+        if not path.is_dir():
+            dirs.append(label)
+    if not workspace.state_file.exists():
+        dirs.append(".devctl/state.json")
+    info["missingDirs"] = dirs
+    if info["missingFields"] or info["missingArchiveExcludes"] or info["missingDirs"]:
+        info["upgradeAvailable"] = True
+    return info
+
+
+def upgrade_workspace_command(args: argparse.Namespace) -> int:
+    init_workspace_arg = getattr(args, "workspace", None) or getattr(args, "workspace_override", None)
+    workspace_root = expand_user_path(init_workspace_arg).resolve() if init_workspace_arg else Path.cwd().resolve()
+    state_dir = workspace_root / ".devctl"
+    config_path = state_dir / "workspace.json"
+    json_enabled = bool(getattr(args, "json", False))
+
+    payload: dict[str, Any] = {
+        "ok": False,
+        "version": DEVCTL_VERSION,
+        "mode": "upgrade",
+        "workspaceRoot": str(workspace_root),
+        "configPath": str(config_path),
+        "created": [],
+        "updatedFields": [],
+        "warnings": [],
+        "changed": False,
+    }
+
+    if not config_path.exists():
+        message = f"Конфигурация рабочей области не найдена: {config_path}. Для нового workspace используйте обычный `devctl init`."
+        payload["error"] = message
+        maybe_emit_json(json_enabled, payload)
+        raise DevctlError(message)
+
+    config = read_json_file(config_path)
+    if not isinstance(config, dict):
+        message = f"workspace.json должен быть JSON-объектом: {config_path}"
+        payload["error"] = message
+        maybe_emit_json(json_enabled, payload)
+        raise DevctlError(message)
+
+    project_dir_value = str(config.get("projectDir") or args.project or DEFAULT_PROJECT_DIR_NAME)
+    patches_dir_value = str(config.get("patchesDir") or args.patches or DEFAULT_PATCHES_DIR_NAME)
+    archives_dir_value = str(config.get("archivesDir") or args.archives or DEFAULT_ARCHIVES_DIR_NAME)
+    uts_dir_value = str(config.get("userTestSpaceDir") or getattr(args, "uts", DEFAULT_UTS_DIR_NAME) or DEFAULT_UTS_DIR_NAME)
+
+    upgraded_config, updated_fields = normalize_workspace_config_for_upgrade(
+        config,
+        project_dir=project_dir_value,
+        patches_dir=patches_dir_value,
+        archives_dir=archives_dir_value,
+        uts_dir=uts_dir_value,
+        branch=getattr(args, "branch", None),
+    )
+
+    workspace = discover_workspace_from_config(config_path) if not updated_fields else None
+    if workspace is None:
+        # Use the upgraded config before it is written to resolve newly introduced paths.
+        temp_path = config_path
+        temp_config = upgraded_config
+        project_root = resolve_workspace_path(workspace_root, temp_config.get("projectDir"), default=DEFAULT_PROJECT_DIR_NAME, key="projectDir")
+        patches_dir = resolve_workspace_path(workspace_root, temp_config.get("patchesDir"), default=DEFAULT_PATCHES_DIR_NAME, key="patchesDir")
+        archives_dir = resolve_workspace_path(workspace_root, temp_config.get("archivesDir"), default=DEFAULT_ARCHIVES_DIR_NAME, key="archivesDir")
+        uts_dir = resolve_workspace_path(workspace_root, temp_config.get("userTestSpaceDir"), default=DEFAULT_UTS_DIR_NAME, key="userTestSpaceDir")
+        workspace = Workspace(
+            project_root=project_root,
+            workspace_root=workspace_root,
+            patches_dir=patches_dir,
+            archives_dir=archives_dir,
+            uts_dir=uts_dir,
+            state_dir=state_dir,
+            state_file=state_dir / "state.json",
+        )
+
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    for path_to_create, label in ((workspace.patches_dir, "patches"), (workspace.archives_dir, "archives"), (workspace.uts_dir, "UserTestSpace"), (workspace.state_dir, ".devctl")):
+        existed = path_to_create.exists()
+        path_to_create.mkdir(parents=True, exist_ok=True)
+        if not existed:
+            payload["created"].append(label)
+
+    if getattr(args, "create_project", False):
+        existed = workspace.project_root.exists()
+        workspace.project_root.mkdir(parents=True, exist_ok=True)
+        if not existed:
+            payload["created"].append("project")
+    elif not workspace.project_root.exists():
+        payload["warnings"].append(f"каталог проекта отсутствует и не создавался: {workspace.project_root}")
+
+    if not workspace.state_file.exists():
+        write_json_file(workspace.state_file, {"version": STATE_VERSION, "runs": []})
+        payload["created"].append(".devctl/state.json")
+
+    if upgraded_config != config:
+        write_json_file(config_path, upgraded_config)
+        payload["changed"] = True
+    payload["updatedFields"] = updated_fields
+    payload["workspace"] = workspace_to_json(discover_workspace_from_config(config_path))
+    payload["ok"] = True
+
+    print_header("devctl init --upgrade")
+    print(f"Корень рабочей области: {workspace_root}")
+    print(f"Конфигурация:         {config_path}")
+    print(f"Обновление config:    {'да' if payload['changed'] else 'не требовалось'}")
+    print(f"Создано:              {', '.join(payload['created']) if payload['created'] else 'ничего'}")
+    print(f"Поля/исключения:      {', '.join(updated_fields) if updated_fields else 'уже актуальны'}")
+    print(f"Каталог UTS:          {workspace.uts_dir}")
+    for warning in payload.get("warnings") or []:
+        print(f"Предупреждение: {warning}")
+    maybe_emit_json(json_enabled, payload)
+    return 0
+
 def init_command(args: argparse.Namespace) -> int:
+    if getattr(args, "upgrade", False):
+        return upgrade_workspace_command(args)
     init_workspace_arg = getattr(args, "workspace", None) or getattr(args, "workspace_override", None)
     workspace_root = expand_user_path(init_workspace_arg).resolve() if init_workspace_arg else Path.cwd().resolve()
     project_path = Path(args.project).expanduser()
@@ -2390,6 +3043,7 @@ def init_command(args: argparse.Namespace) -> int:
 
     patches_dir = (workspace_root / args.patches).resolve()
     archives_dir = (workspace_root / args.archives).resolve()
+    uts_dir = (workspace_root / getattr(args, "uts", DEFAULT_UTS_DIR_NAME)).resolve()
     state_dir = workspace_root / ".devctl"
     config_path = state_dir / "workspace.json"
     json_enabled = bool(getattr(args, "json", False))
@@ -2401,6 +3055,7 @@ def init_command(args: argparse.Namespace) -> int:
         "projectRoot": str(project_root),
         "patchesDir": str(patches_dir),
         "archivesDir": str(archives_dir),
+        "userTestSpaceDir": str(uts_dir),
         "configPath": str(config_path),
         "created": [],
         "warnings": [],
@@ -2414,7 +3069,7 @@ def init_command(args: argparse.Namespace) -> int:
         raise DevctlError(message)
 
     workspace_root.mkdir(parents=True, exist_ok=True)
-    for path_to_create, label in ((patches_dir, "patches"), (archives_dir, "archives"), (state_dir, ".devctl")):
+    for path_to_create, label in ((patches_dir, "patches"), (archives_dir, "archives"), (uts_dir, "UserTestSpace"), (state_dir, ".devctl")):
         existed = path_to_create.exists()
         path_to_create.mkdir(parents=True, exist_ok=True)
         if not existed:
@@ -2430,22 +3085,14 @@ def init_command(args: argparse.Namespace) -> int:
             payload["created"].append("project")
 
     branch = getattr(args, "branch", None)
-    git_config = {
-        "enabled": True,
-        "autoCommit": True,
-        "autoPush": True,
-        "remote": "origin",
-        "requireClean": True,
-        "requireUpToDate": True,
-    }
-    if branch:
-        git_config["branch"] = str(branch)
+    git_config = default_git_config(branch)
 
     config = {
         "version": 1,
         "projectDir": posix_rel_or_dot(project_root, workspace_root),
         "patchesDir": posix_rel_or_dot(patches_dir, workspace_root),
         "archivesDir": posix_rel_or_dot(archives_dir, workspace_root),
+        "userTestSpaceDir": posix_rel_or_dot(uts_dir, workspace_root),
         "git": git_config,
         "archive": {
             "exclude": sorted(ARCHIVE_EXCLUDED_PARTS) + list(ARCHIVE_EXCLUDED_SUFFIXES),
@@ -2481,6 +3128,7 @@ def init_command(args: argparse.Namespace) -> int:
     print(f"Корень проекта:        {project_root} {'[нет]' if not project_root.exists() else ''}")
     print(f"Каталог патчей:       {patches_dir}")
     print(f"Каталог архивов:      {archives_dir}")
+    print(f"Каталог UTS:          {uts_dir}")
     print(f"Конфигурация:         {config_path}")
     if git_result:
         print(f"Git:                  {'инициализирован' if git_result.get('initialized') else 'ошибка'}")
@@ -3288,14 +3936,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser._positionals.title = "команды"
     parser._optionals.title = "параметры"
-    subparsers = parser.add_subparsers(dest="command", required=True, metavar="{init,status,inspect,plan,start,completion,self}")
+    subparsers = parser.add_subparsers(dest="command", required=True, metavar="{init,status,inspect,plan,start,reset,completion,self}")
 
-    init = subparsers.add_parser("init", help="Создать .devctl/workspace.json, patches/ и archives/")
+    init = subparsers.add_parser("init", help="Создать или безопасно обновить структуру workspace")
     init.add_argument("--workspace", default=None, help="Корень рабочей области. По умолчанию текущий каталог.")
     init.add_argument("--project", default=DEFAULT_PROJECT_DIR_NAME, help="Каталог проекта относительно рабочей области или абсолютный путь.")
     init.add_argument("--patches", default=DEFAULT_PATCHES_DIR_NAME, help="Каталог патчей относительно рабочей области.")
     init.add_argument("--archives", default=DEFAULT_ARCHIVES_DIR_NAME, help="Каталог архивов относительно рабочей области.")
+    init.add_argument("--uts", default=DEFAULT_UTS_DIR_NAME, help="Каталог User Test Space относительно рабочей области.")
     init.add_argument("--force", action="store_true", help="Перезаписать существующий .devctl/workspace.json")
+    init.add_argument("--upgrade", action="store_true", help="Безопасно актуализировать существующий workspace без перезаписи пользовательских путей")
     init.add_argument("--json", action="store_true", help="Вывести машинно-читаемый JSON")
     init.add_argument("--create-project", action="store_true", help="Создать каталог проекта, если его ещё нет")
     init.add_argument("--git-init", action="store_true", help="Инициализировать локальный Git-репозиторий в каталоге проекта")
@@ -3312,7 +3962,15 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--json", action="store_true", help="Вывести машинно-читаемый JSON")
     start = subparsers.add_parser("start", help="Применить последний неприменённый патч, выполнить проверки, commit и push")
     start.add_argument("--no-push", action="store_true", help="Отладочный/локальный запуск: commit после зелёных проверок, но без git push")
+    start.add_argument("--keep-failed-patch", action="store_true", help="Не удалять patch.zip автоматически после failed checks/partial apply")
     start.add_argument("--json", action="store_true", help="Добавить финальную JSON-строку с reportPath/archivePath/commitSha/pushResult")
+
+    reset = subparsers.add_parser("reset", help="Откатить project через git reset --hard и git clean")
+    reset.add_argument("--json", action="store_true", help="Вывести машинно-читаемый JSON")
+    reset.add_argument("--keep-patch", action="store_true", help="Не удалять последний failed patch.zip из patches/")
+    reset.add_argument("--delete-patch", default=None, help="Явно удалить указанный patch.zip внутри patches/ после reset")
+    reset.add_argument("--target", default="HEAD", help="Git target для reset --hard. По умолчанию HEAD")
+    reset.add_argument("--clean-mode", choices=("fd", "fdx"), default="fd", help="Режим git clean: fd или fdx. По умолчанию fd")
 
     completion = subparsers.add_parser("completion", help="Вывести shell completion для bash, zsh или fish")
     completion.add_argument("shell", choices=SHELLS, help="Оболочка, для которой нужно вывести completion-скрипт")
@@ -3350,6 +4008,8 @@ def main(argv: list[str] | None = None) -> int:
             return inspect_command(args, plan=True)
         if args.command == "start":
             return start_command(args)
+        if args.command == "reset":
+            return reset_command(args)
         if args.command == "completion":
             return completion_command(args)
         if args.command == "self":

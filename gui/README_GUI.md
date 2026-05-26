@@ -7,14 +7,14 @@ GUI — тонкая оболочка поверх `devctl.py`: CLI остаёт
 - выбор корня рабочей области;
 - инициализация нового workspace из GUI: parent folder + имя workspace + optional Git remote;
 - запоминание последней рабочей области в пользовательском config-файле;
-- карточки состояния: проект, Git, патч, push;
+- карточки состояния: проект, Git, патч, UTS, push;
 - блок `Следующее действие`, который по текущему состоянию workspace предлагает безопасный ближайший шаг;
 - вкладки `План`, `Запуск`, `Отчёт`;
 - большая главная кнопка, которая меняет действие: построить план, запустить конвейер, открыть patches/, показать git status, открыть отчёт и т.п.;
 - запуск `start` в отдельном процессе без зависания окна;
 - live-лог выполнения;
 - `start --no-push` из GUI;
-- кнопки открытия `report.md`, `archives/`, `project/`;
+- кнопки открытия `report.md`, `archives/`, `UserTestSpace/`, `project/`;
 - PyInstaller child-mode: собранный exe может запускать bundled `devctl` как дочерний процесс без установленного Python.
 
 ## Инициализация нового workspace
@@ -37,6 +37,7 @@ GUI — тонкая оболочка поверх `devctl.py`: CLI остаёт
     .git/
   patches/
   archives/
+  UserTestSpace/
 ```
 
 Если remote URL указан, локальный репозиторий `project/` связывается с ним как `origin`. После успешной инициализации GUI автоматически открывает новый workspace так, как если бы он был выбран кнопкой `Выбрать`. Для будущего commit/push на машине должны быть настроены Git identity и доступ к remote через Git Credential Manager/SSH.
@@ -53,6 +54,8 @@ python gui/devctl_gui.py
 python devctl.py status --json
 python devctl.py plan --json
 python devctl.py start --json --no-push
+python devctl.py init --upgrade --json
+python devctl.py reset --json
 ```
 
 ## Сборка Windows EXE
@@ -122,3 +125,13 @@ release/devctl-gui.exe
 - Добавлена кнопка `Скопировать prompt-патча` в нижнюю панель действий.
 - Кнопка копирует в буфер обмена шаблон запроса для ChatGPT, который объясняет, как собирать корректный devctl-патч: `manifest.json`, `PATCH_SUMMARY.md`, `files/`, safe paths, проверки и финальный формат ответа.
 - Тот же шаблон сохранён в `docs/agent/devctl-patch-prompt-template.md` для чтения и редактирования в репозитории.
+
+## Новое в v0.2.0
+
+- GUI синхронизирован с bundled `devctl 0.6.2`.
+- Добавлена тёмная GitHub-like тема: почти чёрный фон, тёмные панели, серый текст и зелёные/жёлтые/красные индикаторы состояния.
+- Появилась карточка `UTS` и кнопка `Открыть UTS/`. После успешного `start` GUI предлагает открыть свежую UTS-копию для ручного тестирования.
+- Добавлена кнопка `Обновить структуру`: она вызывает `devctl init --upgrade` и безопасно добавляет недостающие поля/папки вроде `UserTestSpace/` без перезаписи `project/`.
+- Добавлена кнопка `Reset project`: после явного предупреждения вызывает `devctl reset`, чтобы откатить грязное рабочее дерево через `git reset --hard` и `git clean -fd`.
+- Во вкладке статуса показывается `workspaceConfig`: недостающие поля, archive-исключения и директории.
+- Отчёт запуска показывает auto-reset, удалённый bad patch, UTS project и bytecode cleanup.

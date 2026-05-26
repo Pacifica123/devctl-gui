@@ -17,17 +17,18 @@ except ImportError:  # запуск как python -m gui.devctl_gui
     from .devctl_runner import DevctlRunner, RunResult  # type: ignore
 
 APP_NAME = "devctl GUI"
-APP_VERSION = "0.1.7"
-BUNDLED_DEVCTL_VERSION = "0.5.1"
+APP_VERSION = "0.2.0"
+BUNDLED_DEVCTL_VERSION = "0.6.2"
 
 
 PATCH_PROMPT_TEMPLATE = """Ты работаешь с devctl workspace и должен вернуть не полный архив проекта, а полноценный devctl-патч.
 
 Контекст devctl:
-- workspace содержит project/, patches/, archives/ и .devctl/;
+- workspace содержит project/, patches/, archives/, UserTestSpace/ и .devctl/;
 - devctl применяет patch.zip из patches/ к папке project/;
 - патч должен быть безопасным, воспроизводимым и понятным человеку;
 - GUI/CLI ожидают структуру patch.zip с manifest.json, PATCH_SUMMARY.md и files/.
+- devctl умеет reset, init --upgrade, автооткат failed start, UTS и автоочистку Python bytecode/cache.
 
 Твоя задача:
 1. Изучи текущие файлы проекта, которые нужно менять. Не придумывай содержимое вслепую.
@@ -49,7 +50,7 @@ patch_YYYYMMDD_HHMMSS_short_slug.zip
 Правила для files/:
 - пути внутри files/ должны быть относительными к project/;
 - не клади абсолютные пути;
-- не клади .git/, .env, секреты, __pycache__/, *.pyc, .venv/, dist/, build/, node_modules/;
+- не клади .git/, .env, секреты, __pycache__/, *.pyc, *.pyo, .pytest_cache/, .venv/, dist/, build/, node_modules/;
 - если devctl копирует целые файлы, клади в files/ уже финальные версии изменённых файлов;
 - не меняй unrelated-файлы ради косметики.
 
@@ -389,6 +390,7 @@ class DevctlGui(tk.Tk):
         self.last_plan: dict | None = None
         self.last_report_path: str | None = None
         self.last_archive_path: str | None = None
+        self.last_uts_path: str | None = None
         self.recommended_action_code = "refresh_status"
 
         self.config_data = load_config()
@@ -413,28 +415,56 @@ class DevctlGui(tk.Tk):
         messagebox.showerror(APP_NAME, f"Ошибка в обработчике GUI:\n{val}", parent=self)
 
     def _setup_styles(self) -> None:
+        self.configure(background="#0d1117")
         style = ttk.Style(self)
         try:
             style.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure("Main.TFrame", background="#f6f7f9")
-        style.configure("Card.TFrame", background="#ffffff", relief="solid", borderwidth=1)
-        style.configure("CardTitle.TLabel", background="#ffffff", font=("Segoe UI", 10, "bold"))
-        style.configure("CardMuted.TLabel", background="#ffffff", foreground="#4b5563", font=("Segoe UI", 10))
-        style.configure("CardOk.TLabel", background="#ffffff", foreground="#047857", font=("Segoe UI", 10, "bold"))
-        style.configure("CardWarn.TLabel", background="#ffffff", foreground="#b45309", font=("Segoe UI", 10, "bold"))
-        style.configure("CardBad.TLabel", background="#ffffff", foreground="#b91c1c", font=("Segoe UI", 10, "bold"))
-        style.configure("NextActionTitle.TLabel", background="#ffffff", foreground="#111827", font=("Segoe UI", 12, "bold"))
-        style.configure("NextActionBody.TLabel", background="#ffffff", foreground="#374151", font=("Segoe UI", 10))
-        style.configure("NextActionOk.TLabel", background="#ffffff", foreground="#047857", font=("Segoe UI", 12, "bold"))
-        style.configure("NextActionWarn.TLabel", background="#ffffff", foreground="#b45309", font=("Segoe UI", 12, "bold"))
-        style.configure("NextActionBad.TLabel", background="#ffffff", foreground="#b91c1c", font=("Segoe UI", 12, "bold"))
-        style.configure("Magic.TButton", font=("Segoe UI", 13, "bold"), padding=(18, 12))
-        style.configure("Action.TButton", font=("Segoe UI", 10), padding=(10, 7))
-        style.configure("TLabel", font=("Segoe UI", 10))
-        style.configure("Header.TLabel", font=("Segoe UI", 15, "bold"), background="#f6f7f9")
-        style.configure("Subtle.TLabel", font=("Segoe UI", 9), foreground="#6b7280", background="#f6f7f9")
+
+        self.colors = {
+            "bg": "#0d1117",
+            "panel": "#161b22",
+            "panel2": "#010409",
+            "border": "#30363d",
+            "text": "#c9d1d9",
+            "muted": "#8b949e",
+            "ok": "#3fb950",
+            "warn": "#d29922",
+            "bad": "#f85149",
+            "button": "#21262d",
+            "button_active": "#30363d",
+            "entry": "#0d1117",
+            "select": "#264f78",
+        }
+        c = self.colors
+
+        style.configure(".", background=c["bg"], foreground=c["text"], fieldbackground=c["entry"], bordercolor=c["border"], lightcolor=c["border"], darkcolor=c["border"])
+        style.configure("Main.TFrame", background=c["bg"])
+        style.configure("Card.TFrame", background=c["panel"], relief="solid", borderwidth=1, bordercolor=c["border"])
+        style.configure("TFrame", background=c["bg"])
+        style.configure("TLabel", font=("Segoe UI", 10), background=c["bg"], foreground=c["text"])
+        style.configure("Header.TLabel", font=("Segoe UI", 15, "bold"), background=c["bg"], foreground="#f0f6fc")
+        style.configure("Subtle.TLabel", font=("Segoe UI", 9), foreground=c["muted"], background=c["bg"])
+        style.configure("CardTitle.TLabel", background=c["panel"], foreground="#f0f6fc", font=("Segoe UI", 10, "bold"))
+        style.configure("CardMuted.TLabel", background=c["panel"], foreground=c["muted"], font=("Segoe UI", 10))
+        style.configure("CardOk.TLabel", background=c["panel"], foreground=c["ok"], font=("Segoe UI", 10, "bold"))
+        style.configure("CardWarn.TLabel", background=c["panel"], foreground=c["warn"], font=("Segoe UI", 10, "bold"))
+        style.configure("CardBad.TLabel", background=c["panel"], foreground=c["bad"], font=("Segoe UI", 10, "bold"))
+        style.configure("NextActionTitle.TLabel", background=c["panel"], foreground="#f0f6fc", font=("Segoe UI", 12, "bold"))
+        style.configure("NextActionBody.TLabel", background=c["panel"], foreground=c["text"], font=("Segoe UI", 10))
+        style.configure("NextActionOk.TLabel", background=c["panel"], foreground=c["ok"], font=("Segoe UI", 12, "bold"))
+        style.configure("NextActionWarn.TLabel", background=c["panel"], foreground=c["warn"], font=("Segoe UI", 12, "bold"))
+        style.configure("NextActionBad.TLabel", background=c["panel"], foreground=c["bad"], font=("Segoe UI", 12, "bold"))
+        style.configure("Magic.TButton", font=("Segoe UI", 13, "bold"), padding=(18, 12), background="#238636", foreground="#ffffff", bordercolor="#2ea043")
+        style.map("Magic.TButton", background=[("active", "#2ea043"), ("disabled", c["button"])], foreground=[("disabled", c["muted"])])
+        style.configure("Action.TButton", font=("Segoe UI", 10), padding=(10, 7), background=c["button"], foreground=c["text"], bordercolor=c["border"])
+        style.map("Action.TButton", background=[("active", c["button_active"]), ("disabled", c["button"])], foreground=[("disabled", "#6e7681")])
+        style.configure("TEntry", fieldbackground=c["entry"], foreground=c["text"], insertcolor=c["text"], bordercolor=c["border"], lightcolor=c["border"], darkcolor=c["border"])
+        style.configure("TNotebook", background=c["bg"], borderwidth=0)
+        style.configure("TNotebook.Tab", background=c["button"], foreground=c["muted"], padding=(12, 7))
+        style.map("TNotebook.Tab", background=[("selected", c["panel"])], foreground=[("selected", "#f0f6fc")])
+        style.configure("Vertical.TScrollbar", background=c["button"], troughcolor=c["panel2"], bordercolor=c["border"], arrowcolor=c["muted"])
 
     def _build_ui(self) -> None:
         root = ttk.Frame(self, padding=14, style="Main.TFrame")
@@ -460,6 +490,7 @@ class DevctlGui(tk.Tk):
             "project": StatusCard(cards, "Проект"),
             "git": StatusCard(cards, "Git"),
             "patch": StatusCard(cards, "Патч"),
+            "uts": StatusCard(cards, "UTS"),
             "push": StatusCard(cards, "Push"),
         }
         for index, card in enumerate(self.cards.values()):
@@ -494,18 +525,36 @@ class DevctlGui(tk.Tk):
         self.status_btn = ttk.Button(actions, text="Показать статус", command=self.refresh_status, style="Action.TButton")
         self.plan_btn = ttk.Button(actions, text="Построить план", command=self.build_plan, style="Action.TButton")
         self.no_push_btn = ttk.Button(actions, text="Запустить без push", command=lambda: self.start_pipeline(True), style="Action.TButton")
+        self.upgrade_btn = ttk.Button(actions, text="Обновить структуру", command=self.upgrade_workspace, style="Action.TButton")
+        self.reset_btn = ttk.Button(actions, text="Reset project", command=self.reset_project, style="Action.TButton")
         self.report_btn = ttk.Button(actions, text="Открыть отчёт", command=self.open_report, style="Action.TButton")
         self.archives_btn = ttk.Button(actions, text="Открыть archives/", command=self.open_archives, style="Action.TButton")
+        self.uts_btn = ttk.Button(actions, text="Открыть UTS/", command=self.open_uts, style="Action.TButton")
         self.project_btn = ttk.Button(actions, text="Открыть project/", command=self.open_project, style="Action.TButton")
         self.copy_prompt_btn = ttk.Button(actions, text="Скопировать prompt-патча", command=self.copy_patch_prompt, style="Action.TButton")
-        for widget in (self.init_btn, self.status_btn, self.plan_btn, self.no_push_btn, self.report_btn, self.archives_btn, self.project_btn, self.copy_prompt_btn):
+        for widget in (self.init_btn, self.status_btn, self.plan_btn, self.no_push_btn, self.upgrade_btn, self.reset_btn, self.report_btn, self.archives_btn, self.uts_btn, self.project_btn, self.copy_prompt_btn):
             widget.pack(side="left", padx=(0, 8))
 
     def _make_text_tab(self, title: str) -> tk.Text:
-        frame = ttk.Frame(self.notebook)
+        frame = ttk.Frame(self.notebook, style="Main.TFrame")
         self.notebook.add(frame, text=title)
-        text = tk.Text(frame, wrap="word", font=("Consolas", 10), undo=False)
-        scroll = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+        colors = getattr(self, "colors", {})
+        text = tk.Text(
+            frame,
+            wrap="word",
+            font=("Consolas", 10),
+            undo=False,
+            background=colors.get("panel2", "#010409"),
+            foreground=colors.get("text", "#c9d1d9"),
+            insertbackground=colors.get("text", "#c9d1d9"),
+            selectbackground=colors.get("select", "#264f78"),
+            relief="flat",
+            borderwidth=1,
+            highlightthickness=1,
+            highlightbackground=colors.get("border", "#30363d"),
+            highlightcolor=colors.get("border", "#30363d"),
+        )
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=text.yview, style="Vertical.TScrollbar")
         text.configure(yscrollcommand=scroll.set)
         text.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
@@ -543,9 +592,12 @@ class DevctlGui(tk.Tk):
             "open_patches": self.open_patches,
             "open_project": self.open_project,
             "show_git_status": self.show_git_status,
+            "reset_project": self.reset_project,
+            "upgrade_workspace": self.upgrade_workspace,
             "build_plan": self.build_plan,
             "start_pipeline": lambda: self.start_pipeline(False),
             "open_report": self.open_report,
+            "open_uts": self.open_uts,
             "copy_patch_prompt": self.copy_patch_prompt,
         }
         action = actions.get(self.recommended_action_code, self.refresh_status)
@@ -559,6 +611,22 @@ class DevctlGui(tk.Tk):
 
         project_root = workspace.get("projectRoot") or "project/"
         patches_dir = workspace.get("patchesDir") or "patches/"
+        workspace_config = data.get("workspaceConfig", {}) if isinstance(data.get("workspaceConfig"), dict) else {}
+
+        if workspace.get("projectExists") and workspace_config.get("upgradeAvailable"):
+            missing = []
+            missing.extend(workspace_config.get("missingFields") or [])
+            missing.extend(workspace_config.get("missingArchiveExcludes") or [])
+            missing.extend(workspace_config.get("missingDirs") or [])
+            details = ", ".join(str(item) for item in missing[:8]) or "структура workspace устарела"
+            self._set_next_action(
+                "upgrade_workspace",
+                "Безопасно обновить структуру workspace",
+                f"devctl видит, что workspace можно актуализировать: {details}. Команда init --upgrade не трогает project/ и пользовательские пути, а только добавляет недостающую инфраструктуру.",
+                "Обновить структуру workspace",
+                "warn",
+            )
+            return
 
         if not workspace.get("projectExists"):
             self._set_next_action(
@@ -592,10 +660,10 @@ class DevctlGui(tk.Tk):
 
         if git.get("clean") is False:
             self._set_next_action(
-                "show_git_status",
-                "Разобраться с локальными изменениями Git",
-                "Рабочее дерево содержит локальные изменения. Перед запуском конвейера их нужно закоммитить, убрать или осознанно обработать вручную.",
-                "Показать git status",
+                "reset_project",
+                "Рабочее дерево project/ загрязнено",
+                "Можно открыть git status для ручной проверки или нажать reset: GUI вызовет devctl reset после отдельного предупреждения и откатит project/ через git reset --hard + git clean -fd.",
+                "Reset project",
                 "warn",
             )
             return
@@ -685,6 +753,16 @@ class DevctlGui(tk.Tk):
     def _recommend_after_result(self, data: dict, result: RunResult) -> None:
         status = data.get("status") if isinstance(data, dict) else None
         if result.returncode == 0:
+            uts_project = data.get("utsProjectDir") if isinstance(data, dict) else None
+            if uts_project:
+                self._set_next_action(
+                    "open_uts",
+                    "Открыть свежую UTS-копию",
+                    f"Конвейер завершился со статусом {status or 'OK'}. Успешный post-снимок уже развёрнут для ручного тестирования: {uts_project}",
+                    "Открыть UTS",
+                    "ok",
+                )
+                return
             self._set_next_action(
                 "open_report",
                 "Открыть отчёт успешного запуска",
@@ -793,6 +871,7 @@ class DevctlGui(tk.Tk):
             "--project", "project",
             "--patches", "patches",
             "--archives", "archives",
+            "--uts", "UserTestSpace",
             "--create-project",
             "--git-init",
             "--branch", branch,
@@ -834,6 +913,7 @@ class DevctlGui(tk.Tk):
             f"Project: {data.get('projectRoot') or workspace / 'project'}",
             f"Patches: {data.get('patchesDir') or workspace / 'patches'}",
             f"Archives: {data.get('archivesDir') or workspace / 'archives'}",
+            f"UTS: {data.get('userTestSpaceDir') or workspace / 'UserTestSpace'}",
             f"Config: {data.get('configPath') or workspace / '.devctl' / 'workspace.json'}",
             "",
             "== git ==",
@@ -869,6 +949,106 @@ class DevctlGui(tk.Tk):
         lines.extend([f"- {item}" for item in errors] or ["нет"])
         return "\n".join(lines) + "\n"
 
+    def upgrade_workspace(self) -> None:
+        self._save_workspace()
+        proceed = messagebox.askyesno(
+            APP_NAME,
+            "Безопасно обновить структуру workspace?\n\n"
+            "GUI вызовет `devctl init --upgrade`: команда добавляет недостающие поля конфигурации и служебные папки вроде UserTestSpace/, но не трогает содержимое project/.",
+            parent=self,
+        )
+        if not proceed:
+            return
+        self.set_running(True)
+        self.set_text(self.report_text, "Обновляю структуру workspace через devctl init --upgrade...\n")
+        self.notebook.select(2)
+        self._run_async(["init", "--upgrade", "--json", "--workspace", self.workspace_var.get()], self._on_upgrade_workspace_done)
+
+    def _on_upgrade_workspace_done(self, result: RunResult) -> None:
+        self.set_running(False)
+        data = result.json_data or {}
+        self.set_text(self.report_text, self._format_upgrade_result(data if isinstance(data, dict) else {}, result))
+        self.notebook.select(2)
+        self.refresh_status()
+        if result.ok and isinstance(data, dict) and data.get("ok"):
+            messagebox.showinfo(APP_NAME, "Структура workspace обновлена.", parent=self)
+        else:
+            messagebox.showerror(APP_NAME, "Не удалось обновить структуру workspace. Подробности во вкладке «Отчёт».", parent=self)
+
+    def _format_upgrade_result(self, data: dict, result: RunResult) -> str:
+        if not data:
+            return (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
+        lines = [
+            "== обновление структуры workspace ==",
+            f"Статус: {'OK' if data.get('ok') else 'ошибка'}",
+            f"Код возврата: {result.returncode}",
+            f"Workspace: {data.get('workspaceRoot')}",
+            f"Config: {data.get('configPath')}",
+            f"Config изменён: {data.get('changed')}",
+            "",
+            "== создано ==",
+        ]
+        lines.extend([f"- {item}" for item in data.get("created") or []] or ["ничего"])
+        lines.append("")
+        lines.append("== обновлённые поля/исключения ==")
+        lines.extend([f"- {item}" for item in data.get("updatedFields") or []] or ["уже актуально"])
+        warnings = data.get("warnings") or []
+        lines.append("")
+        lines.append("== предупреждения ==")
+        lines.extend([f"- {item}" for item in warnings] or ["нет"])
+        if data.get("error"):
+            lines.extend(["", "== ошибка ==", str(data.get("error"))])
+        return "\n".join(lines) + "\n"
+
+    def reset_project(self) -> None:
+        self._save_workspace()
+        proceed = messagebox.askyesno(
+            APP_NAME,
+            "Откатить project/?\n\n"
+            "Будет выполнен `devctl reset`: git reset --hard HEAD и git clean -fd. "
+            "Локальные незакоммиченные изменения и untracked-файлы в project/ будут удалены.",
+            parent=self,
+        )
+        if not proceed:
+            return
+        self.set_running(True)
+        self.set_text(self.report_text, "Выполняю devctl reset...\n")
+        self.notebook.select(2)
+        self._run_async(["reset", "--json"], self._on_reset_done)
+
+    def _on_reset_done(self, result: RunResult) -> None:
+        self.set_running(False)
+        data = result.json_data or {}
+        self.set_text(self.report_text, self._format_reset_result(data if isinstance(data, dict) else {}, result))
+        self.notebook.select(2)
+        self.refresh_status()
+        if result.ok and isinstance(data, dict) and data.get("ok"):
+            messagebox.showinfo(APP_NAME, "project/ откатан и очищен.", parent=self)
+        else:
+            messagebox.showerror(APP_NAME, "devctl reset завершился с ошибкой. Подробности во вкладке «Отчёт».", parent=self)
+
+    def _format_reset_result(self, data: dict, result: RunResult) -> str:
+        if not data:
+            return (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
+        lines = [
+            "== reset project ==",
+            f"Статус: {'OK' if data.get('ok') else 'ошибка'}",
+            f"Код возврата: {result.returncode}",
+            f"Project: {data.get('projectRoot')}",
+            f"Target: {data.get('target')}",
+            f"Clean mode: {data.get('cleanMode')}",
+            f"Patch удалён: {data.get('patchDeleted') or 'нет'}",
+            "",
+            "== git status before ==",
+            data.get("gitStatusBefore") or "clean/нет данных",
+            "",
+            "== git status after ==",
+            data.get("gitStatusAfter") or "clean",
+        ]
+        if data.get("error"):
+            lines.extend(["", "== ошибка ==", str(data.get("error"))])
+        return "\n".join(str(item) for item in lines) + "\n"
+
     def _save_workspace(self) -> None:
         workspace = str(Path(self.workspace_var.get()).expanduser().resolve())
         if not looks_like_pyinstaller_temp(Path(workspace)):
@@ -903,6 +1083,7 @@ class DevctlGui(tk.Tk):
             self.cards["project"].set("ошибка", "bad")
             self.cards["git"].set("недоступно", "bad")
             self.cards["patch"].set("неизвестно", "warn")
+            self.cards["uts"].set("неизвестно", "warn")
             self.cards["push"].set("неизвестно", "warn")
             self._set_next_action(
                 "choose_workspace",
@@ -928,6 +1109,10 @@ class DevctlGui(tk.Tk):
             self.cards["patch"].set(latest.get("title") or latest.get("name") or "найден", kind)
         else:
             self.cards["patch"].set("нет патчей", "warn")
+        if workspace.get("userTestSpaceDirExists"):
+            self.cards["uts"].set("готов", "ok")
+        else:
+            self.cards["uts"].set("нужно обновить", "warn")
         self.cards["push"].set("см. план" if latest else "неизвестно", "neutral")
         self._recommend_from_status(data)
         self.set_text(self.plan_text, self._format_status(data))
@@ -955,6 +1140,16 @@ class DevctlGui(tk.Tk):
             f"Проект: {workspace.get('projectRoot')}",
             f"Патчи: {workspace.get('patchesDir')}",
             f"Архивы: {workspace.get('archivesDir')}",
+            f"UTS: {workspace.get('userTestSpaceDir')} ({'есть' if workspace.get('userTestSpaceDirExists') else 'нет'})",
+            "",
+            "== конфигурация workspace ==",
+        ]
+        workspace_config = data.get("workspaceConfig", {}) if isinstance(data.get("workspaceConfig"), dict) else {}
+        lines.extend([
+            f"Требует обновления: {workspace_config.get('upgradeAvailable')}",
+            f"Недостающие поля: {', '.join(str(x) for x in workspace_config.get('missingFields') or []) or 'нет'}",
+            f"Недостающие исключения archive: {', '.join(str(x) for x in workspace_config.get('missingArchiveExcludes') or []) or 'нет'}",
+            f"Недостающие директории: {', '.join(str(x) for x in workspace_config.get('missingDirs') or []) or 'нет'}",
             "",
             "== git ==",
             f"Доступен: {git.get('available')}",
@@ -965,7 +1160,7 @@ class DevctlGui(tk.Tk):
             "",
             "== патчи ==",
             f"Всего кандидатов: {patches.get('count', 0)}",
-        ]
+        ])
         latest = patches.get("latest")
         if latest:
             lines.extend([
@@ -1081,7 +1276,7 @@ class DevctlGui(tk.Tk):
 
     def set_running(self, running: bool) -> None:
         state = "disabled" if running else "normal"
-        for widget in (self.main_button, self.no_push_btn, self.status_btn, self.plan_btn, self.init_btn, self.init_top_btn, self.copy_prompt_btn):
+        for widget in (self.main_button, self.no_push_btn, self.status_btn, self.plan_btn, self.init_btn, self.init_top_btn, self.upgrade_btn, self.reset_btn, self.report_btn, self.archives_btn, self.uts_btn, self.project_btn, self.copy_prompt_btn):
             widget.configure(state=state)
 
     def _on_start_done(self, result: RunResult) -> None:
@@ -1090,6 +1285,7 @@ class DevctlGui(tk.Tk):
         if isinstance(data, dict):
             self.last_report_path = data.get("reportPath") or self.last_report_path
             self.last_archive_path = data.get("archivePath") or self.last_archive_path
+            self.last_uts_path = data.get("utsProjectDir") or self.last_uts_path
             self.set_text(self.report_text, self._format_result(data, result))
             self._recommend_after_result(data, result)
         else:
@@ -1117,6 +1313,10 @@ class DevctlGui(tk.Tk):
             f"Каталог архива: {data.get('archivePath') or 'нет'}",
             f"Коммит: {data.get('commitSha') or 'нет'}",
             f"Push: {data.get('pushResult') or 'нет'}",
+            f"Auto-reset: {data.get('autoResetPerformed')}",
+            f"Удалённый bad patch: {data.get('badPatchDeleted') or 'нет'}",
+            f"UTS project: {data.get('utsProjectDir') or 'нет'}",
+            f"Bytecode очищено: {len(data.get('cleanedBytecodePaths') or [])}",
             "",
             "== предупреждения ==",
         ]
@@ -1158,6 +1358,14 @@ class DevctlGui(tk.Tk):
         data = self.last_status or {}
         workspace = data.get("workspace", {}) if isinstance(data, dict) else {}
         open_path(workspace.get("patchesDir"))
+
+    def open_uts(self) -> None:
+        if self.last_uts_path:
+            open_path(self.last_uts_path)
+            return
+        data = self.last_status or {}
+        workspace = data.get("workspace", {}) if isinstance(data, dict) else {}
+        open_path(workspace.get("userTestSpaceDir"))
 
     def open_project(self) -> None:
         data = self.last_status or {}
