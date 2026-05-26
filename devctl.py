@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-devctl v0.4 — проектно-независимый конвейер применения ИИ-патчей на чистом Python.
+devctl v0.5.1 — проектно-независимый конвейер применения ИИ-патчей на чистом Python.
 
 Базовый поток конвейера: применить патч -> выполнить проверки -> создать коммит -> отправить в remote.
 
@@ -31,11 +31,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-DEVCTL_VERSION = "0.4"
+DEVCTL_VERSION = "0.5.1"
 STATE_VERSION = 1
 DEFAULT_PROJECT_DIR_NAME = "project"
 DEFAULT_PATCHES_DIR_NAME = "patches"
 DEFAULT_ARCHIVES_DIR_NAME = "archives"
+DEVCTL_WORKSPACE_ENV = "DEVCTL_WORKSPACE"
+DEVCTL_COMMAND_NAME = "devctl"
 LEGACY_ARCHIVES_DIR_ALIASES = ("arhives",)
 PATCH_FILENAME_RE = re.compile(r"patch_(\d{8})_(\d{6})(?:_.*)?\.zip$", re.IGNORECASE)
 
@@ -49,6 +51,9 @@ ARCHIVE_EXCLUDED_PARTS = {
     "coverage",
     "logs",
     "tmp",
+    "patches",
+    "archives",
+    "arhives",
     "__pycache__",
 }
 ARCHIVE_EXCLUDED_SUFFIXES = (".db", ".sqlite", ".sqlite3")
@@ -59,7 +64,7 @@ RELEASE_ZIP_PLACEHOLDER = "тут_был_zip_архив.txt"
 RELEASE_EXE_PLACEHOLDER = "тут_был_экзешник.txt"
 ARCHIVE_SIZE_WARNING_BYTES = 100 * 1024 * 1024
 DANGEROUS_GIT_PATH_SUFFIXES = ARCHIVE_EXCLUDED_SUFFIXES + (".pyc", ".pyo")
-DANGEROUS_GIT_PATH_PARTS = {"node_modules", "target", ".git", "__pycache__"}
+DANGEROUS_GIT_PATH_PARTS = {"node_modules", "target", ".git", "__pycache__", "patches", "archives", "arhives"}
 
 
 class DevctlError(Exception):
@@ -315,6 +320,25 @@ def write_json_file(path: Path, data: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def expand_user_path(raw: str | Path) -> Path:
+    """Expand ~ and environment variables in a user-supplied path."""
+    return Path(os.path.expandvars(str(raw))).expanduser()
+
+
+def workspace_override_value(workspace_arg: str | None = None) -> str | None:
+    value = (workspace_arg or "").strip()
+    if value:
+        return value
+    value = (os.environ.get(DEVCTL_WORKSPACE_ENV) or "").strip()
+    return value or None
+
+
+def workspace_arg_from_namespace(args: argparse.Namespace | None) -> str | None:
+    if args is None:
+        return None
+    return getattr(args, "workspace_override", None) or getattr(args, "workspace", None)
+
+
 def candidate_start_dirs() -> list[Path]:
     result: list[Path] = []
     try:
@@ -399,15 +423,9 @@ def find_project_root() -> Path:
     )
 
 
-def discover_workspace() -> Workspace:
-    config_path = find_workspace_config()
-    if config_path:
-        return discover_workspace_from_config(config_path)
-
-    project_root = find_project_root()
+def fallback_workspace_for_project(project_root: Path) -> Workspace:
     workspace_root = project_root.parent
     patches_dir = workspace_root / DEFAULT_PATCHES_DIR_NAME
-
     archives_dir = workspace_root / DEFAULT_ARCHIVES_DIR_NAME
     if not archives_dir.exists():
         for alias in LEGACY_ARCHIVES_DIR_ALIASES:
@@ -415,17 +433,68 @@ def discover_workspace() -> Workspace:
             if legacy.exists():
                 archives_dir = legacy
                 break
-
     state_dir = workspace_root / ".devctl"
-    state_file = state_dir / "state.json"
     return Workspace(
-        project_root=project_root,
-        workspace_root=workspace_root,
-        patches_dir=patches_dir,
-        archives_dir=archives_dir,
-        state_dir=state_dir,
-        state_file=state_file,
+        project_root=project_root.resolve(),
+        workspace_root=workspace_root.resolve(),
+        patches_dir=patches_dir.resolve(),
+        archives_dir=archives_dir.resolve(),
+        state_dir=state_dir.resolve(),
+        state_file=(state_dir / "state.json").resolve(),
     )
+
+
+def discover_workspace_from_override(raw: str) -> Workspace:
+    candidate = expand_user_path(raw).resolve()
+    if candidate.is_file():
+        if candidate.name != "workspace.json":
+            raise DevctlError(f"--workspace должен указывать на каталог workspace, каталог проекта или .devctl/workspace.json: {candidate}")
+        return discover_workspace_from_config(candidate)
+
+    if candidate.name == ".devctl" and (candidate / "workspace.json").is_file():
+        return discover_workspace_from_config(candidate / "workspace.json")
+
+    config_path = candidate / ".devctl" / "workspace.json"
+    if config_path.is_file():
+        return discover_workspace_from_config(config_path)
+
+    # Удобный режим для уже существующих Git/проектных каталогов без devctl-init:
+    # `devctl -w /path/to/repo status` будет искать patches/ и archives/ рядом с repo.
+    if candidate.exists() and looks_like_project_root(candidate):
+        return fallback_workspace_for_project(candidate)
+
+    if candidate.exists() and candidate.is_dir():
+        state_dir = candidate / ".devctl"
+        archives_dir = candidate / DEFAULT_ARCHIVES_DIR_NAME
+        if not archives_dir.exists():
+            for alias in LEGACY_ARCHIVES_DIR_ALIASES:
+                legacy = candidate / alias
+                if legacy.exists():
+                    archives_dir = legacy
+                    break
+        return Workspace(
+            project_root=(candidate / DEFAULT_PROJECT_DIR_NAME).resolve(),
+            workspace_root=candidate.resolve(),
+            patches_dir=(candidate / DEFAULT_PATCHES_DIR_NAME).resolve(),
+            archives_dir=archives_dir.resolve(),
+            state_dir=state_dir.resolve(),
+            state_file=(state_dir / "state.json").resolve(),
+        )
+
+    raise DevctlError(f"Workspace не найден: {candidate}. Создайте его командой `devctl init --workspace {candidate}`.")
+
+
+def discover_workspace(workspace_arg: str | None = None) -> Workspace:
+    override = workspace_override_value(workspace_arg)
+    if override:
+        return discover_workspace_from_override(override)
+
+    config_path = find_workspace_config()
+    if config_path:
+        return discover_workspace_from_config(config_path)
+
+    project_root = find_project_root()
+    return fallback_workspace_for_project(project_root)
 
 
 def validate_workspace_for_start(workspace: Workspace) -> None:
@@ -1663,9 +1732,9 @@ def git_status_to_json(workspace: Workspace) -> dict[str, Any]:
     return info
 
 
-def build_status_payload() -> tuple[dict[str, Any], int]:
+def build_status_payload(workspace_arg: str | None = None) -> tuple[dict[str, Any], int]:
     try:
-        workspace = discover_workspace()
+        workspace = discover_workspace(workspace_arg)
     except DevctlError as exc:
         return {"ok": False, "version": DEVCTL_VERSION, "error": str(exc)}, 2
 
@@ -1711,12 +1780,12 @@ def build_status_payload() -> tuple[dict[str, Any], int]:
 
 def status_command(args: argparse.Namespace | None = None) -> int:
     if args is not None and getattr(args, "json", False):
-        payload, code = build_status_payload()
+        payload, code = build_status_payload(workspace_arg_from_namespace(args))
         emit_json(payload)
         return code
 
     try:
-        workspace = discover_workspace()
+        workspace = discover_workspace(workspace_arg_from_namespace(args))
     except DevctlError as exc:
         print(f"[ОШИБКА] {exc}")
         return 2
@@ -1899,7 +1968,7 @@ def prepare_context(workspace: Workspace, state: dict[str, Any]) -> RunContext |
 
 def start_command(args: argparse.Namespace) -> int:
     try:
-        workspace = discover_workspace()
+        workspace = discover_workspace(workspace_arg_from_namespace(args))
         validate_workspace_for_start(workspace)
         state = load_state(workspace)
         ctx = prepare_context(workspace, state)
@@ -2311,7 +2380,8 @@ def init_git_repository(project_root: Path, *, branch: str | None, remote_url: s
 
 
 def init_command(args: argparse.Namespace) -> int:
-    workspace_root = Path(args.workspace).expanduser().resolve() if args.workspace else Path.cwd().resolve()
+    init_workspace_arg = getattr(args, "workspace", None) or getattr(args, "workspace_override", None)
+    workspace_root = expand_user_path(init_workspace_arg).resolve() if init_workspace_arg else Path.cwd().resolve()
     project_path = Path(args.project).expanduser()
     if project_path.is_absolute():
         project_root = project_path.resolve()
@@ -2457,7 +2527,7 @@ def zip_files_under_root(path: Path, files_root: str) -> list[str]:
 
 def build_inspect_payload(args: argparse.Namespace, *, plan: bool = False) -> tuple[dict[str, Any], int]:
     try:
-        workspace = discover_workspace()
+        workspace = discover_workspace(workspace_arg_from_namespace(args))
     except DevctlError as exc:
         return {"ok": False, "version": DEVCTL_VERSION, "error": str(exc), "plan": plan}, 2
 
@@ -2553,7 +2623,7 @@ def inspect_command(args: argparse.Namespace, *, plan: bool = False) -> int:
         emit_json(payload)
         return code
 
-    workspace = discover_workspace()
+    workspace = discover_workspace(workspace_arg_from_namespace(args))
     patch = select_patch_for_readonly(workspace, args.patch)
     if not patch:
         print("Zip-файлы патчей не найдены.")
@@ -2629,6 +2699,575 @@ def inspect_command(args: argparse.Namespace, *, plan: bool = False) -> int:
     return 0
 
 # ---------------------------------------------------------------------------
+# Release install / shell completion helpers
+# ---------------------------------------------------------------------------
+
+
+SHELLS = ("bash", "zsh", "fish")
+SELF_ACTIONS = ("install", "update", "info", "uninstall", "install-completions")
+INSTALL_METADATA_FILENAME = "install.json"
+
+
+def user_home() -> Path:
+    return expand_user_path(os.environ.get("HOME", "~")).resolve()
+
+
+def xdg_data_home() -> Path:
+    return expand_user_path(os.environ.get("XDG_DATA_HOME", str(user_home() / ".local" / "share"))).resolve()
+
+
+def xdg_config_home() -> Path:
+    return expand_user_path(os.environ.get("XDG_CONFIG_HOME", str(user_home() / ".config"))).resolve()
+
+
+def default_user_bin_dir() -> Path:
+    return (user_home() / ".local" / "bin").resolve()
+
+
+def default_app_dir() -> Path:
+    return (xdg_data_home() / "devctl").resolve()
+
+
+def shell_single_quote(value: str | Path) -> str:
+    return "'" + str(value).replace("'", "'\"'\"'") + "'"
+
+
+def path_is_on_path(directory: Path) -> bool:
+    directory_text = str(directory.resolve())
+    for item in os.environ.get("PATH", "").split(os.pathsep):
+        if not item:
+            continue
+        try:
+            if str(Path(item).expanduser().resolve()) == directory_text:
+                return True
+        except Exception:
+            if item == directory_text:
+                return True
+    return False
+
+
+def normalize_shells(shell: str | Iterable[str]) -> list[str]:
+    if isinstance(shell, str):
+        raw = SHELLS if shell == "auto" else (shell,)
+    else:
+        raw = tuple(shell)
+    result: list[str] = []
+    for item in raw:
+        if item not in SHELLS:
+            raise DevctlError(f"Неизвестная оболочка для completion: {item}")
+        if item not in result:
+            result.append(item)
+    return result
+
+
+def ensure_devctl_launcher(launcher_path: Path, managed_script: Path, *, force: bool) -> None:
+    if launcher_path.exists() and not force:
+        try:
+            existing = launcher_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            existing = ""
+        if "managed by devctl self install" not in existing:
+            raise DevctlError(
+                f"Файл запуска уже существует и не похож на управляемый devctl launcher: {launcher_path}. "
+                "Повторите с --force, если его можно перезаписать."
+            )
+    launcher_path.parent.mkdir(parents=True, exist_ok=True)
+    launcher_text = "\n".join(
+        [
+            "#!/usr/bin/env sh",
+            "# managed by devctl self install",
+            f"exec python3 {shell_single_quote(managed_script)} \"$@\"",
+            "",
+        ]
+    )
+    launcher_path.write_text(launcher_text, encoding="utf-8", newline="\n")
+    launcher_path.chmod(0o755)
+
+
+def copy_managed_script(source: Path, managed_script: Path) -> None:
+    if not source.is_file():
+        raise DevctlError(f"Исходный devctl.py не найден: {source}")
+    managed_script.parent.mkdir(parents=True, exist_ok=True)
+    tmp = managed_script.with_suffix(managed_script.suffix + ".tmp")
+    shutil.copy2(source, tmp)
+    tmp.chmod(0o755)
+    tmp.replace(managed_script)
+
+
+def completion_target_path(shell: str) -> Path:
+    if shell == "bash":
+        return xdg_data_home() / "bash-completion" / "completions" / DEVCTL_COMMAND_NAME
+    if shell == "zsh":
+        return xdg_data_home() / "zsh" / "site-functions" / f"_{DEVCTL_COMMAND_NAME}"
+    if shell == "fish":
+        return xdg_config_home() / "fish" / "completions" / f"{DEVCTL_COMMAND_NAME}.fish"
+    raise DevctlError(f"Неизвестная оболочка для completion: {shell}")
+
+
+def completion_script(shell: str, *, command_name: str = DEVCTL_COMMAND_NAME) -> str:
+    if shell == "bash":
+        return f"""# bash completion for devctl; generated by `devctl completion bash`.
+_devctl_completion() {{
+  local -a completions
+  local cword
+  cword="${{COMP_CWORD}}"
+  mapfile -t completions < <("${{COMP_WORDS[0]}}" __complete --position "$cword" bash -- "${{COMP_WORDS[@]}}")
+  COMPREPLY=("${{completions[@]}}")
+  return 0
+}}
+complete -o nosort -F _devctl_completion {command_name}
+"""
+    if shell == "zsh":
+        return "#compdef " + command_name + f"""
+# zsh completion for devctl; generated by `devctl completion zsh`.
+_devctl() {{
+  local -a completions
+  completions=("${{(@f)$($words[1] __complete --position $((CURRENT - 1)) zsh -- "${{words[@]}}")}}")
+  compadd -Q -- "${{completions[@]}}"
+}}
+_devctl "$@"
+"""
+    if shell == "fish":
+        return f"""# fish completion for devctl; generated by `devctl completion fish`.
+function __devctl_complete
+    set -l tokens (commandline -opc)
+    set -l current (commandline -ct)
+    if test -n "$current"
+        set tokens $tokens $current
+    else
+        set tokens $tokens ""
+    end
+    set -l position (math (count $tokens) - 1)
+    {command_name} __complete --position $position fish -- $tokens
+end
+complete -c {command_name} -f -a "(__devctl_complete)"
+"""
+    raise DevctlError(f"Поддерживаемые shell: {', '.join(SHELLS)}")
+
+
+def install_completion_files(shell: str | Iterable[str], *, force: bool = False) -> list[Path]:
+    written: list[Path] = []
+    for item in normalize_shells(shell):
+        target = completion_target_path(item)
+        if target.exists() and not force:
+            try:
+                existing = target.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                existing = ""
+            if "generated by `devctl completion" not in existing:
+                raise DevctlError(
+                    f"Completion-файл уже существует и не похож на управляемый devctl: {target}. "
+                    "Повторите с --force, если его можно перезаписать."
+                )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(completion_script(item), encoding="utf-8", newline="\n")
+        written.append(target)
+    return written
+
+
+def completion_activation_hint(shell: str) -> str:
+    if shell == "zsh":
+        zsh_dir = completion_target_path("zsh").parent
+        return "\n".join(
+            [
+                "Zsh не подхватывает пользовательский site-functions сам. Добавь в ~/.zshrc ДО compinit:",
+                f"  fpath=({shell_single_quote(zsh_dir)} $fpath)",
+                "  autoload -Uz compinit && compinit",
+                "Для текущей сессии можно выполнить эти же строки, затем открыть новый prompt.",
+            ]
+        )
+    if shell == "bash":
+        return "Bash completion подхватывается после нового shell-сеанса, если установлен и загружен пакет bash-completion."
+    if shell == "fish":
+        return "Fish обычно подхватывает ~/.config/fish/completions/devctl.fish автоматически после нового prompt или shell-сеанса."
+    return ""
+
+
+def print_completion_activation_hints(shells: Iterable[str]) -> None:
+    shell_list = normalize_shells(shells)
+    if not shell_list:
+        return
+    print("Подсказки по активации completion:")
+    for shell in shell_list:
+        print(f"  [{shell}] {completion_activation_hint(shell)}")
+
+
+def remove_if_managed(path: Path, marker: str, *, force: bool) -> bool:
+    if not path.exists():
+        return False
+    if not force:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            text = ""
+        if marker not in text:
+            raise DevctlError(f"Не удаляю неуправляемый файл без --force: {path}")
+    path.unlink()
+    return True
+
+
+def install_paths_from_args(args: argparse.Namespace) -> tuple[Path, Path, Path]:
+    bin_dir = expand_user_path(args.bin_dir).resolve() if getattr(args, "bin_dir", None) else default_user_bin_dir()
+    app_dir = expand_user_path(args.app_dir).resolve() if getattr(args, "app_dir", None) else default_app_dir()
+    launcher = bin_dir / DEVCTL_COMMAND_NAME
+    managed_script = app_dir / "devctl.py"
+    return bin_dir, app_dir, launcher if launcher.name == DEVCTL_COMMAND_NAME else bin_dir / DEVCTL_COMMAND_NAME
+
+
+def install_metadata_path(app_dir: Path) -> Path:
+    return app_dir / INSTALL_METADATA_FILENAME
+
+
+def read_install_metadata(app_dir: Path) -> dict[str, Any]:
+    path = install_metadata_path(app_dir)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def find_git_root_for_path(path: Path) -> Path | None:
+    start = path if path.is_dir() else path.parent
+    result = run_command(["git", "rev-parse", "--show-toplevel"], start, timeout=30)
+    if result.returncode != 0:
+        return None
+    root = result.stdout.strip()
+    return Path(root).resolve() if root else None
+
+
+def git_current_branch(git_root: Path | None) -> str | None:
+    if git_root is None:
+        return None
+    result = run_command(["git", "rev-parse", "--abbrev-ref", "HEAD"], git_root, timeout=30)
+    if result.returncode != 0:
+        return None
+    branch = result.stdout.strip()
+    if not branch or branch == "HEAD":
+        return None
+    return branch
+
+
+def looks_like_devctl_source(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return False
+    return "DEVCTL_VERSION" in text and "DEVCTL_COMMAND_NAME" in text and "def build_parser" in text
+
+
+def write_install_metadata(
+    app_dir: Path,
+    *,
+    source: Path,
+    bin_dir: Path,
+    launcher: Path,
+    managed_script: Path,
+    completion_shells: Iterable[str],
+) -> Path:
+    git_root = find_git_root_for_path(source)
+    data: dict[str, Any] = {
+        "schemaVersion": 1,
+        "devctlVersion": DEVCTL_VERSION,
+        "installedAt": iso_now(),
+        "sourcePath": str(source.resolve()),
+        "sourceGitRoot": str(git_root) if git_root else None,
+        "sourceGitBranch": git_current_branch(git_root),
+        "binDir": str(bin_dir.resolve()),
+        "appDir": str(app_dir.resolve()),
+        "launcherPath": str(launcher.resolve()),
+        "managedScriptPath": str(managed_script.resolve()),
+        "completionShells": normalize_shells(completion_shells),
+    }
+    app_dir.mkdir(parents=True, exist_ok=True)
+    path = install_metadata_path(app_dir)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
+    tmp.replace(path)
+    return path
+
+
+def recorded_update_source(app_dir: Path) -> tuple[Path | None, dict[str, Any]]:
+    metadata = read_install_metadata(app_dir)
+    source_path = metadata.get("sourcePath")
+    if isinstance(source_path, str):
+        candidate = expand_user_path(source_path).resolve()
+        if looks_like_devctl_source(candidate):
+            return candidate, metadata
+    source_git_root = metadata.get("sourceGitRoot")
+    if isinstance(source_git_root, str):
+        candidate = expand_user_path(source_git_root).resolve() / "devctl.py"
+        if looks_like_devctl_source(candidate):
+            return candidate, metadata
+    return None, metadata
+
+
+def source_from_args(args: argparse.Namespace, *, update: bool, app_dir: Path) -> tuple[Path, dict[str, Any], str]:
+    raw = getattr(args, "source", None)
+    if raw:
+        return expand_user_path(raw).resolve(), read_install_metadata(app_dir), "--source"
+
+    if update:
+        cwd_candidate = (Path.cwd() / "devctl.py").resolve()
+        current_file = Path(__file__).resolve()
+        if cwd_candidate != current_file and looks_like_devctl_source(cwd_candidate):
+            return cwd_candidate, read_install_metadata(app_dir), "./devctl.py"
+
+        recorded, metadata = recorded_update_source(app_dir)
+        if recorded is not None:
+            return recorded, metadata, "install metadata"
+        return current_file, metadata, "current installed file"
+
+    return Path(__file__).resolve(), read_install_metadata(app_dir), "current file"
+
+
+def maybe_pull_source(source: Path, *, enabled: bool) -> Path | None:
+    if not enabled:
+        return None
+    git_root = find_git_root_for_path(source)
+    if git_root is None:
+        raise DevctlError(f"--pull-source указан, но источник не находится внутри Git-репозитория: {source}")
+    fetch = run_command(["git", "fetch", "--all", "--prune"], git_root, timeout=180)
+    if fetch.returncode != 0:
+        raise DevctlError(f"git fetch для источника обновления не прошёл: {fetch.stderr.strip() or fetch.stdout.strip()}")
+    pull = run_command(["git", "pull", "--ff-only"], git_root, timeout=180)
+    if pull.returncode != 0:
+        raise DevctlError(f"git pull --ff-only для источника обновления не прошёл: {pull.stderr.strip() or pull.stdout.strip()}")
+    return git_root
+
+
+def completion_shells_from_metadata(metadata: dict[str, Any]) -> list[str]:
+    raw = metadata.get("completionShells")
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, str) and item in SHELLS]
+
+
+def self_install_or_update(args: argparse.Namespace, *, update: bool) -> int:
+    bin_dir, app_dir, launcher = install_paths_from_args(args)
+    source, metadata, source_reason = source_from_args(args, update=update, app_dir=app_dir)
+    pulled_root = maybe_pull_source(source, enabled=bool(getattr(args, "pull_source", False))) if update else None
+    managed_script = app_dir / "devctl.py"
+
+    requested_completion_shells: list[str] = []
+    if getattr(args, "with_completions", False):
+        requested_completion_shells = normalize_shells(getattr(args, "shell", "auto"))
+    elif update:
+        requested_completion_shells = completion_shells_from_metadata(metadata)
+
+    copy_managed_script(source, managed_script)
+    ensure_devctl_launcher(launcher, managed_script, force=bool(getattr(args, "force", False)))
+    completion_paths: list[Path] = []
+    if requested_completion_shells:
+        completion_paths = install_completion_files(requested_completion_shells, force=bool(getattr(args, "force", False)))
+
+    metadata_path = write_install_metadata(
+        app_dir,
+        source=source,
+        bin_dir=bin_dir,
+        launcher=launcher,
+        managed_script=managed_script,
+        completion_shells=requested_completion_shells,
+    )
+
+    print_header("devctl self update" if update else "devctl self install")
+    print(f"Версия:            {DEVCTL_VERSION}")
+    print(f"Источник:          {source} [{source_reason}]")
+    if pulled_root is not None:
+        print(f"Git pull источника: {pulled_root}")
+    print(f"Управляемая копия: {managed_script}")
+    print(f"Команда:           {launcher}")
+    print(f"Метаданные:        {metadata_path}")
+    if update and source.resolve() == Path(__file__).resolve():
+        print("Предупреждение: источник обновления совпал с текущим установленным файлом; реального обновления могло не быть.")
+        print("Подсказка: из каталога свежего devctl-репозитория запусти `devctl self update --with-completions` или передай `--source /path/to/devctl.py`.")
+    if completion_paths:
+        print("Completion-файлы:")
+        for path in completion_paths:
+            print(f"  {path}")
+        print_completion_activation_hints(requested_completion_shells)
+    if not path_is_on_path(bin_dir):
+        print(f"Предупреждение: {bin_dir} не найден в PATH. Добавьте его в shell-профиль, чтобы запускать `{DEVCTL_COMMAND_NAME}` из любого каталога.")
+    print(f"Проверка:          {DEVCTL_COMMAND_NAME} --version")
+    return 0
+
+
+def self_info(args: argparse.Namespace) -> int:
+    bin_dir, app_dir, launcher = install_paths_from_args(args)
+    managed_script = app_dir / "devctl.py"
+    metadata = read_install_metadata(app_dir)
+    update_source, _ = recorded_update_source(app_dir)
+    print_header("devctl self info")
+    print(f"Версия текущего файла: {DEVCTL_VERSION}")
+    print(f"Текущий devctl.py:     {Path(__file__).resolve()}")
+    print(f"Ожидаемая команда:     {launcher} {'[есть]' if launcher.exists() else '[нет]'}")
+    print(f"Управляемая копия:     {managed_script} {'[есть]' if managed_script.exists() else '[нет]'}")
+    print(f"Метаданные установки:  {install_metadata_path(app_dir)} {'[есть]' if metadata else '[нет]'}")
+    print(f"Источник обновления:   {update_source if update_source else '[не задан или недоступен]'}")
+    if metadata.get("sourceGitRoot"):
+        print(f"Git-источник:          {metadata.get('sourceGitRoot')} ({metadata.get('sourceGitBranch') or 'branch unknown'})")
+    print(f"Bin dir в PATH:        {path_is_on_path(bin_dir)}")
+    print(f"DEVCTL_WORKSPACE:      {os.environ.get(DEVCTL_WORKSPACE_ENV) or '[не задан]'}")
+    installed_shells: list[str] = []
+    for shell in SHELLS:
+        target = completion_target_path(shell)
+        exists = target.exists()
+        if exists:
+            installed_shells.append(shell)
+        print(f"Completion {shell}:       {target} {'[есть]' if exists else '[нет]'}")
+    if installed_shells:
+        print_completion_activation_hints(installed_shells)
+    return 0
+
+
+def self_uninstall(args: argparse.Namespace) -> int:
+    bin_dir, app_dir, launcher = install_paths_from_args(args)
+    managed_script = app_dir / "devctl.py"
+    force = bool(getattr(args, "force", False))
+    removed: list[Path] = []
+    if remove_if_managed(launcher, "managed by devctl self install", force=force):
+        removed.append(launcher)
+    if remove_if_managed(managed_script, "devctl", force=True):
+        removed.append(managed_script)
+    if remove_if_managed(install_metadata_path(app_dir), "sourcePath", force=True):
+        removed.append(install_metadata_path(app_dir))
+    if getattr(args, "with_completions", False):
+        for shell in normalize_shells(getattr(args, "shell", "auto")):
+            target = completion_target_path(shell)
+            if remove_if_managed(target, "generated by `devctl completion", force=force):
+                removed.append(target)
+    print_header("devctl self uninstall")
+    if removed:
+        for path in removed:
+            print(f"Удалено: {path}")
+    else:
+        print("Управляемые файлы установки не найдены.")
+    return 0
+
+
+def self_command(args: argparse.Namespace) -> int:
+    action = args.action
+    if action == "install":
+        return self_install_or_update(args, update=False)
+    if action == "update":
+        return self_install_or_update(args, update=True)
+    if action == "info":
+        return self_info(args)
+    if action == "install-completions":
+        written = install_completion_files(getattr(args, "shell", "auto"), force=bool(getattr(args, "force", False)))
+        bin_dir, app_dir, launcher = install_paths_from_args(args)
+        managed_script = app_dir / "devctl.py"
+        metadata = read_install_metadata(app_dir)
+        source_path = metadata.get("sourcePath")
+        source = expand_user_path(source_path).resolve() if isinstance(source_path, str) else Path(__file__).resolve()
+        write_install_metadata(
+            app_dir,
+            source=source,
+            bin_dir=bin_dir,
+            launcher=launcher,
+            managed_script=managed_script,
+            completion_shells=normalize_shells(getattr(args, "shell", "auto")),
+        )
+        print_header("devctl self install-completions")
+        for path in written:
+            print(f"Записано: {path}")
+        print_completion_activation_hints(normalize_shells(getattr(args, "shell", "auto")))
+        return 0
+    if action == "uninstall":
+        return self_uninstall(args)
+    raise DevctlError(f"Неизвестное self-действие: {action}")
+
+
+def completion_command(args: argparse.Namespace) -> int:
+    print(completion_script(args.shell), end="")
+    return 0
+
+
+def parser_subcommands(parser: argparse.ArgumentParser) -> dict[str, argparse.ArgumentParser]:
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return {name: subparser for name, subparser in action.choices.items() if not name.startswith("__")}
+    return {}
+
+
+def parser_option_strings(parser: argparse.ArgumentParser) -> list[str]:
+    options: list[str] = []
+    for action in parser._actions:
+        if action.help == argparse.SUPPRESS:
+            continue
+        options.extend(action.option_strings)
+    return options
+
+
+def completion_filter(candidates: Iterable[str], prefix: str) -> list[str]:
+    result = sorted({item for item in candidates if item.startswith(prefix)})
+    return result
+
+
+def complete_from_parser(parser: argparse.ArgumentParser, words: list[str], position: int) -> list[str]:
+    if words and words[0] == "--":
+        words = words[1:]
+    if not words:
+        words = [DEVCTL_COMMAND_NAME, ""]
+        position = 1
+    if position >= len(words):
+        words.append("")
+    position = max(0, min(position, len(words) - 1))
+    current = words[position] if position < len(words) else ""
+    prior = words[1:position]
+    subcommands = parser_subcommands(parser)
+    global_options = parser_option_strings(parser)
+    global_value_options = {"-w", "--workspace"}
+
+    command: str | None = None
+    skip_next = False
+    for token in prior:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in global_value_options:
+            skip_next = True
+            continue
+        if token in subcommands:
+            command = token
+            break
+
+    if command is None:
+        if current.startswith("-"):
+            return completion_filter(global_options, current)
+        return completion_filter(list(subcommands.keys()), current)
+
+    if command == "completion" and not current.startswith("-"):
+        return completion_filter(SHELLS, current)
+    if command == "self":
+        after_command = prior[prior.index(command) + 1:] if command in prior else []
+        action = next((token for token in after_command if not token.startswith("-")), None)
+        if action is None and not current.startswith("-"):
+            return completion_filter(SELF_ACTIONS, current)
+        if action in {"install-completions"} and not current.startswith("-"):
+            return completion_filter(("auto", *SHELLS), current)
+
+    subparser = subcommands.get(command)
+    if subparser and (current.startswith("-") or current == ""):
+        return completion_filter(parser_option_strings(subparser), current)
+    return []
+
+
+def complete_command(args: argparse.Namespace) -> int:
+    words = list(getattr(args, "words", []) or [])
+    if words and words[0] == "--":
+        words = words[1:]
+    parser = build_parser()
+    for item in complete_from_parser(parser, words, int(args.position)):
+        print(item)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -2639,9 +3278,17 @@ def build_parser() -> argparse.ArgumentParser:
         add_help=False,
     )
     parser.add_argument("-h", "--help", action="help", help="показать это сообщение и выйти")
+    parser.add_argument("--version", action="version", version=f"devctl {DEVCTL_VERSION}", help="показать версию devctl и выйти")
+    parser.add_argument(
+        "-w",
+        "--workspace",
+        dest="workspace_override",
+        default=None,
+        help=f"Рабочая область или проект. Также можно задать переменной {DEVCTL_WORKSPACE_ENV}.",
+    )
     parser._positionals.title = "команды"
     parser._optionals.title = "параметры"
-    subparsers = parser.add_subparsers(dest="command", required=True, metavar="{init,status,inspect,plan,start}")
+    subparsers = parser.add_subparsers(dest="command", required=True, metavar="{init,status,inspect,plan,start,completion,self}")
 
     init = subparsers.add_parser("init", help="Создать .devctl/workspace.json, patches/ и archives/")
     init.add_argument("--workspace", default=None, help="Корень рабочей области. По умолчанию текущий каталог.")
@@ -2666,6 +3313,26 @@ def build_parser() -> argparse.ArgumentParser:
     start = subparsers.add_parser("start", help="Применить последний неприменённый патч, выполнить проверки, commit и push")
     start.add_argument("--no-push", action="store_true", help="Отладочный/локальный запуск: commit после зелёных проверок, но без git push")
     start.add_argument("--json", action="store_true", help="Добавить финальную JSON-строку с reportPath/archivePath/commitSha/pushResult")
+
+    completion = subparsers.add_parser("completion", help="Вывести shell completion для bash, zsh или fish")
+    completion.add_argument("shell", choices=SHELLS, help="Оболочка, для которой нужно вывести completion-скрипт")
+
+    self_cmd = subparsers.add_parser("self", help="Установить, обновить или проверить установленную devctl-утилиту")
+    self_cmd.add_argument("action", choices=SELF_ACTIONS, help="Действие: install/update/info/uninstall/install-completions")
+    self_cmd.add_argument("--bin-dir", default=None, help="Каталог для команды devctl. По умолчанию ~/.local/bin")
+    self_cmd.add_argument("--app-dir", default=None, help="Каталог управляемой копии devctl.py. По умолчанию ~/.local/share/devctl")
+    self_cmd.add_argument("--source", default=None, help="Откуда брать devctl.py при install/update. По умолчанию текущий файл.")
+    self_cmd.add_argument("--with-completions", action="store_true", help="Также установить или удалить completion-файлы")
+    self_cmd.add_argument("--shell", choices=("auto", *SHELLS), default="auto", help="Для какого shell ставить completions. По умолчанию auto = bash+zsh+fish")
+    self_cmd.add_argument("--force", action="store_true", help="Перезаписать или удалить уже существующие управляемые файлы")
+    self_cmd.add_argument("--pull-source", action="store_true", help="Для self update сначала выполнить git fetch + git pull --ff-only в репозитории источника")
+
+    complete = subparsers.add_parser("__complete", help=argparse.SUPPRESS)
+    complete.add_argument("shell", choices=SHELLS)
+    complete.add_argument("--position", type=int, required=True)
+    complete.add_argument("words", nargs=argparse.REMAINDER)
+    # argparse does not hide subcommands with help=SUPPRESS from the grouped help automatically.
+    subparsers._choices_actions = [action for action in subparsers._choices_actions if action.dest != "__complete"]
     return parser
 
 
@@ -2683,6 +3350,12 @@ def main(argv: list[str] | None = None) -> int:
             return inspect_command(args, plan=True)
         if args.command == "start":
             return start_command(args)
+        if args.command == "completion":
+            return completion_command(args)
+        if args.command == "self":
+            return self_command(args)
+        if args.command == "__complete":
+            return complete_command(args)
     except DevctlError as exc:
         print(f"[ОШИБКА] {exc}")
         return 2

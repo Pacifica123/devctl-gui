@@ -17,7 +17,8 @@ except ImportError:  # запуск как python -m gui.devctl_gui
     from .devctl_runner import DevctlRunner, RunResult  # type: ignore
 
 APP_NAME = "devctl GUI"
-APP_VERSION = "0.1.6"
+APP_VERSION = "0.1.7"
+BUNDLED_DEVCTL_VERSION = "0.5.1"
 
 
 PATCH_PROMPT_TEMPLATE = """Ты работаешь с devctl workspace и должен вернуть не полный архив проекта, а полноценный devctl-патч.
@@ -182,6 +183,10 @@ def run_devctl_child(argv: list[str]) -> int:
         print("[ОШИБКА] child-режим ожидает: --devctl-child <workspace> <devctl args...>", file=sys.stderr)
         return 2
     workspace = Path(argv[0]).expanduser().resolve()
+    # Ядро devctl 0.5+ умеет явный workspace override через DEVCTL_WORKSPACE.
+    # Оставляем chdir для обратной совместимости, но дополнительно фиксируем
+    # workspace в окружении, чтобы status/plan/start не зависели от cwd child-процесса.
+    os.environ["DEVCTL_WORKSPACE"] = str(workspace)
     devctl_args = argv[1:]
     if devctl_args and devctl_args[0] == "init":
         workspace.mkdir(parents=True, exist_ok=True)
@@ -438,7 +443,7 @@ class DevctlGui(tk.Tk):
         top = ttk.Frame(root, style="Main.TFrame")
         top.pack(fill="x")
         ttk.Label(top, text="Рабочая область", style="Header.TLabel").pack(side="left")
-        ttk.Label(top, text=f"devctl v0.4 · GUI v{APP_VERSION}", style="Subtle.TLabel").pack(side="right")
+        ttk.Label(top, text=f"devctl v{BUNDLED_DEVCTL_VERSION} · GUI v{APP_VERSION}", style="Subtle.TLabel").pack(side="right")
 
         path_row = ttk.Frame(root, style="Main.TFrame")
         path_row.pack(fill="x", pady=(8, 12))
