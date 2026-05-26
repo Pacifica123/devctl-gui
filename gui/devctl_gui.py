@@ -17,7 +17,7 @@ except ImportError:  # запуск как python -m gui.devctl_gui
     from .devctl_runner import DevctlRunner, RunResult  # type: ignore
 
 APP_NAME = "devctl GUI"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 BUNDLED_DEVCTL_VERSION = "0.6.2"
 
 
@@ -278,6 +278,75 @@ class StatusCard(ttk.Frame):
         self.value_label.configure(text=text, style=style)
 
 
+class ToolTip:
+    """Лёгкая tooltip-подсказка для компактных icon-кнопок.
+
+    В нижней панели теперь показываются только монохромные символы, поэтому
+    полный текст действия должен быть доступен без догадок. Делаем это без
+    внешних зависимостей и без сложной графики, чтобы GUI оставался простым
+    Tkinter-приложением.
+    """
+
+    def __init__(self, widget: tk.Widget, text: str, *, delay_ms: int = 450) -> None:
+        self.widget = widget
+        self.text = text
+        self.delay_ms = delay_ms
+        self._after_id: str | None = None
+        self._window: tk.Toplevel | None = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _event: tk.Event | None = None) -> None:
+        self._cancel()
+        self._after_id = self.widget.after(self.delay_ms, self._show)
+
+    def _cancel(self) -> None:
+        if self._after_id is not None:
+            try:
+                self.widget.after_cancel(self._after_id)
+            except tk.TclError:
+                pass
+            self._after_id = None
+
+    def _show(self) -> None:
+        if self._window is not None or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 8
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+        except tk.TclError:
+            return
+        window = tk.Toplevel(self.widget)
+        window.wm_overrideredirect(True)
+        window.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(
+            window,
+            text=self.text,
+            justify="left",
+            background="#161b22",
+            foreground="#f0f6fc",
+            activebackground="#161b22",
+            activeforeground="#f0f6fc",
+            relief="solid",
+            borderwidth=1,
+            padx=8,
+            pady=5,
+            font=("Segoe UI", 9),
+        )
+        label.pack()
+        self._window = window
+
+    def _hide(self, _event: tk.Event | None = None) -> None:
+        self._cancel()
+        if self._window is not None:
+            try:
+                self._window.destroy()
+            except tk.TclError:
+                pass
+            self._window = None
+
+
 class InitWorkspaceDialog(tk.Toplevel):
     """Небольшой modal-dialog для создания нового devctl workspace."""
 
@@ -381,8 +450,8 @@ class DevctlGui(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"{APP_NAME} v{APP_VERSION}")
-        self.geometry("1100x740")
-        self.minsize(920, 620)
+        self.geometry("1120x760")
+        self.minsize(980, 640)
 
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.current_process = None
@@ -460,11 +529,20 @@ class DevctlGui(tk.Tk):
         style.map("Magic.TButton", background=[("active", "#2ea043"), ("disabled", c["button"])], foreground=[("disabled", c["muted"])])
         style.configure("Action.TButton", font=("Segoe UI", 10), padding=(10, 7), background=c["button"], foreground=c["text"], bordercolor=c["border"])
         style.map("Action.TButton", background=[("active", c["button_active"]), ("disabled", c["button"])], foreground=[("disabled", "#6e7681")])
+        style.configure("Icon.TButton", font=("Segoe UI Symbol", 12, "bold"), padding=(6, 5), background=c["button"], foreground=c["text"], bordercolor=c["border"])
+        style.map("Icon.TButton", background=[("active", c["button_active"]), ("disabled", c["button"])], foreground=[("disabled", "#6e7681")])
         style.configure("TEntry", fieldbackground=c["entry"], foreground=c["text"], insertcolor=c["text"], bordercolor=c["border"], lightcolor=c["border"], darkcolor=c["border"])
         style.configure("TNotebook", background=c["bg"], borderwidth=0)
         style.configure("TNotebook.Tab", background=c["button"], foreground=c["muted"], padding=(12, 7))
         style.map("TNotebook.Tab", background=[("selected", c["panel"])], foreground=[("selected", "#f0f6fc")])
         style.configure("Vertical.TScrollbar", background=c["button"], troughcolor=c["panel2"], bordercolor=c["border"], arrowcolor=c["muted"])
+
+
+    def _make_icon_button(self, master: tk.Misc, icon: str, tooltip: str, command) -> ttk.Button:
+        """Создать компактную нижнюю кнопку: символ вместо длинного текста."""
+        button = ttk.Button(master, text=icon, width=3, command=command, style="Icon.TButton")
+        ToolTip(button, tooltip)
+        return button
 
     def _build_ui(self) -> None:
         root = ttk.Frame(self, padding=14, style="Main.TFrame")
@@ -520,20 +598,34 @@ class DevctlGui(tk.Tk):
         self.report_text = self._make_text_tab("Отчёт")
 
         actions = ttk.Frame(root, style="Main.TFrame")
-        actions.pack(fill="x", pady=(12, 0))
-        self.init_btn = ttk.Button(actions, text="Инициализировать workspace", command=self.init_workspace, style="Action.TButton")
-        self.status_btn = ttk.Button(actions, text="Показать статус", command=self.refresh_status, style="Action.TButton")
-        self.plan_btn = ttk.Button(actions, text="Построить план", command=self.build_plan, style="Action.TButton")
-        self.no_push_btn = ttk.Button(actions, text="Запустить без push", command=lambda: self.start_pipeline(True), style="Action.TButton")
-        self.upgrade_btn = ttk.Button(actions, text="Обновить структуру", command=self.upgrade_workspace, style="Action.TButton")
-        self.reset_btn = ttk.Button(actions, text="Reset project", command=self.reset_project, style="Action.TButton")
-        self.report_btn = ttk.Button(actions, text="Открыть отчёт", command=self.open_report, style="Action.TButton")
-        self.archives_btn = ttk.Button(actions, text="Открыть archives/", command=self.open_archives, style="Action.TButton")
-        self.uts_btn = ttk.Button(actions, text="Открыть UTS/", command=self.open_uts, style="Action.TButton")
-        self.project_btn = ttk.Button(actions, text="Открыть project/", command=self.open_project, style="Action.TButton")
-        self.copy_prompt_btn = ttk.Button(actions, text="Скопировать prompt-патча", command=self.copy_patch_prompt, style="Action.TButton")
-        for widget in (self.init_btn, self.status_btn, self.plan_btn, self.no_push_btn, self.upgrade_btn, self.reset_btn, self.report_btn, self.archives_btn, self.uts_btn, self.project_btn, self.copy_prompt_btn):
-            widget.pack(side="left", padx=(0, 8))
+        actions.pack(fill="x", pady=(10, 0))
+        self.init_btn = self._make_icon_button(actions, "＋", "Инициализировать workspace", self.init_workspace)
+        self.status_btn = self._make_icon_button(actions, "●", "Показать статус", self.refresh_status)
+        self.plan_btn = self._make_icon_button(actions, "☷", "Построить dry-run план", self.build_plan)
+        self.no_push_btn = self._make_icon_button(actions, "▶", "Запустить конвейер без push", lambda: self.start_pipeline(True))
+        self.upgrade_btn = self._make_icon_button(actions, "⇧", "Безопасно обновить структуру workspace", self.upgrade_workspace)
+        self.reset_btn = self._make_icon_button(actions, "↺", "Reset project: git reset --hard + git clean", self.reset_project)
+        self.report_btn = self._make_icon_button(actions, "☰", "Открыть последний отчёт", self.open_report)
+        self.archives_btn = self._make_icon_button(actions, "▤", "Открыть archives/", self.open_archives)
+        self.uts_btn = self._make_icon_button(actions, "◇", "Открыть UserTestSpace/ или свежую UTS-копию", self.open_uts)
+        self.project_btn = self._make_icon_button(actions, "⌂", "Открыть project/", self.open_project)
+        self.copy_prompt_btn = self._make_icon_button(actions, "⧉", "Скопировать prompt-патча", self.copy_patch_prompt)
+        self.action_buttons = (
+            self.init_btn,
+            self.status_btn,
+            self.plan_btn,
+            self.no_push_btn,
+            self.upgrade_btn,
+            self.reset_btn,
+            self.report_btn,
+            self.archives_btn,
+            self.uts_btn,
+            self.project_btn,
+            self.copy_prompt_btn,
+        )
+        for index, widget in enumerate(self.action_buttons):
+            widget.grid(row=0, column=index, sticky="w", padx=(0, 6))
+        actions.columnconfigure(len(self.action_buttons), weight=1)
 
     def _make_text_tab(self, title: str) -> tk.Text:
         frame = ttk.Frame(self.notebook, style="Main.TFrame")
