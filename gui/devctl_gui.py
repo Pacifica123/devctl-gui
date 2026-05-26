@@ -17,7 +17,7 @@ except ImportError:  # запуск как python -m gui.devctl_gui
     from .devctl_runner import DevctlRunner, RunResult  # type: ignore
 
 APP_NAME = "devctl GUI"
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.2.2"
 BUNDLED_DEVCTL_VERSION = "0.6.2"
 
 
@@ -589,16 +589,13 @@ class DevctlGui(tk.Tk):
         self.next_action_body.pack(anchor="w", pady=(4, 0))
 
         self.main_button = ttk.Button(root, text="Проверить workspace", command=self.perform_recommended_action, style="Magic.TButton")
-        self.main_button.pack(fill="x", pady=(0, 12))
+        self.main_button.pack(fill="x", pady=(0, 10))
 
-        self.notebook = ttk.Notebook(root)
-        self.notebook.pack(fill="both", expand=True)
-        self.plan_text = self._make_text_tab("План")
-        self.run_text = self._make_text_tab("Запуск")
-        self.report_text = self._make_text_tab("Отчёт")
-
+        # Панель действий должна быть видна сразу после запуска окна. Раньше она
+        # находилась под растягиваемым notebook-логом и могла уезжать ниже
+        # нижнего края окна, пока пользователь вручную не увеличит высоту.
         actions = ttk.Frame(root, style="Main.TFrame")
-        actions.pack(fill="x", pady=(10, 0))
+        actions.pack(fill="x", pady=(0, 8))
         self.init_btn = self._make_icon_button(actions, "＋", "Инициализировать workspace", self.init_workspace)
         self.status_btn = self._make_icon_button(actions, "●", "Показать статус", self.refresh_status)
         self.plan_btn = self._make_icon_button(actions, "☷", "Построить dry-run план", self.build_plan)
@@ -609,7 +606,8 @@ class DevctlGui(tk.Tk):
         self.archives_btn = self._make_icon_button(actions, "▤", "Открыть archives/", self.open_archives)
         self.uts_btn = self._make_icon_button(actions, "◇", "Открыть UserTestSpace/ или свежую UTS-копию", self.open_uts)
         self.project_btn = self._make_icon_button(actions, "⌂", "Открыть project/", self.open_project)
-        self.copy_prompt_btn = self._make_icon_button(actions, "⧉", "Скопировать prompt-патча", self.copy_patch_prompt)
+        self.copy_output_btn = self._make_icon_button(actions, "⧉", "Скопировать текущий вывод активной вкладки", self.copy_current_output)
+        self.copy_prompt_btn = self._make_icon_button(actions, "✎", "Скопировать prompt-патча", self.copy_patch_prompt)
         self.action_buttons = (
             self.init_btn,
             self.status_btn,
@@ -621,11 +619,18 @@ class DevctlGui(tk.Tk):
             self.archives_btn,
             self.uts_btn,
             self.project_btn,
+            self.copy_output_btn,
             self.copy_prompt_btn,
         )
         for index, widget in enumerate(self.action_buttons):
             widget.grid(row=0, column=index, sticky="w", padx=(0, 6))
         actions.columnconfigure(len(self.action_buttons), weight=1)
+
+        self.notebook = ttk.Notebook(root)
+        self.notebook.pack(fill="both", expand=True)
+        self.plan_text = self._make_text_tab("План")
+        self.run_text = self._make_text_tab("Запуск")
+        self.report_text = self._make_text_tab("Отчёт")
 
     def _make_text_tab(self, title: str) -> tk.Text:
         frame = ttk.Frame(self.notebook, style="Main.TFrame")
@@ -892,6 +897,35 @@ class DevctlGui(tk.Tk):
         ])
         self.set_text(self.plan_text, "\n".join(lines) + "\n")
         self.notebook.select(0)
+
+    def _current_output_widget(self) -> tuple[str, tk.Text]:
+        selected = self.notebook.select()
+        tabs = [
+            ("План", self.plan_text),
+            ("Запуск", self.run_text),
+            ("Отчёт", self.report_text),
+        ]
+        for title, widget in tabs:
+            if str(widget.master) == selected:
+                return title, widget
+        return "План", self.plan_text
+
+    def copy_current_output(self) -> None:
+        """Надёжно копирует весь текст активной вкладки вывода.
+
+        Копирование выделения из disabled Text в Tkinter на Windows может вести
+        себя нестабильно. Эта кнопка читает содержимое виджета напрямую и
+        кладёт его в clipboard независимо от selection/focus/state.
+        """
+        title, widget = self._current_output_widget()
+        text = widget.get("1.0", "end-1c")
+        if not text.strip():
+            messagebox.showinfo(APP_NAME, f"Во вкладке «{title}» пока нет текста для копирования.", parent=self)
+            return
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.update()
+        messagebox.showinfo(APP_NAME, f"Текущий вывод вкладки «{title}» скопирован в буфер обмена.", parent=self)
 
     def copy_patch_prompt(self) -> None:
         """Копирует в буфер обмена шаблон запроса для новой ChatGPT-сессии."""
@@ -1368,7 +1402,7 @@ class DevctlGui(tk.Tk):
 
     def set_running(self, running: bool) -> None:
         state = "disabled" if running else "normal"
-        for widget in (self.main_button, self.no_push_btn, self.status_btn, self.plan_btn, self.init_btn, self.init_top_btn, self.upgrade_btn, self.reset_btn, self.report_btn, self.archives_btn, self.uts_btn, self.project_btn, self.copy_prompt_btn):
+        for widget in (self.main_button, self.no_push_btn, self.status_btn, self.plan_btn, self.init_btn, self.init_top_btn, self.upgrade_btn, self.reset_btn, self.report_btn, self.archives_btn, self.uts_btn, self.project_btn, self.copy_output_btn, self.copy_prompt_btn):
             widget.configure(state=state)
 
     def _on_start_done(self, result: RunResult) -> None:
