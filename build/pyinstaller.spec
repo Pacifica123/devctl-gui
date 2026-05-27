@@ -2,7 +2,7 @@
 """PyInstaller spec for devctl GUI.
 
 Run from the project root:
-    pyinstaller build\pyinstaller.spec --clean --noconfirm
+    pyinstaller build/pyinstaller.spec --clean --noconfirm
 
 The final executable is written to:
     release/devctl-gui.exe
@@ -13,7 +13,10 @@ from pathlib import Path
 
 from PyInstaller.config import CONF
 
-project_root = Path(SPECPATH).resolve().parent.parent
+spec_dir = Path(SPECPATH).resolve()
+if not spec_dir.is_dir():
+    spec_dir = spec_dir.parent
+project_root = spec_dir.parent
 release_dir = project_root / "release"
 release_dir.mkdir(exist_ok=True)
 

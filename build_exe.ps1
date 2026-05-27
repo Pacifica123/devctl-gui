@@ -15,7 +15,19 @@ if (-not (Test-Path ".venv")) {
 }
 
 & ".\.venv\Scripts\python.exe" -m pip install --upgrade pip pyinstaller
+if ($LASTEXITCODE -ne 0) {
+    throw "pip install failed with exit code $LASTEXITCODE"
+}
+
 & ".\.venv\Scripts\pyinstaller.exe" "build\pyinstaller.spec" --clean --noconfirm
+if ($LASTEXITCODE -ne 0) {
+    throw "PyInstaller failed with exit code $LASTEXITCODE"
+}
+
+$ExePath = Join-Path $ProjectRoot "release\devctl-gui.exe"
+if (-not (Test-Path $ExePath)) {
+    throw "Build finished but expected exe was not created: $ExePath"
+}
 
 Write-Host ""
-Write-Host "Done: $ProjectRoot\release\devctl-gui.exe"
+Write-Host "Done: $ExePath"

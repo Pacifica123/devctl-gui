@@ -17,7 +17,7 @@ except ImportError:  # запуск как python -m gui.devctl_gui
     from .devctl_runner import DevctlRunner, RunResult  # type: ignore
 
 APP_NAME = "devctl GUI"
-APP_VERSION = "0.2.4"
+APP_VERSION = "0.2.5"
 BUNDLED_DEVCTL_VERSION = "0.6.5"
 
 
