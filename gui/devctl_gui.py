@@ -17,8 +17,8 @@ except ImportError:  # запуск как python -m gui.devctl_gui
     from .devctl_runner import DevctlRunner, RunResult  # type: ignore
 
 APP_NAME = "devctl GUI"
-APP_VERSION = "0.2.2"
-BUNDLED_DEVCTL_VERSION = "0.6.2"
+APP_VERSION = "0.2.3"
+BUNDLED_DEVCTL_VERSION = "0.6.4"
 
 
 PATCH_PROMPT_TEMPLATE = """Ты работаешь с devctl workspace и должен вернуть не полный архив проекта, а полноценный devctl-патч.
@@ -599,7 +599,8 @@ class DevctlGui(tk.Tk):
         self.init_btn = self._make_icon_button(actions, "＋", "Инициализировать workspace", self.init_workspace)
         self.status_btn = self._make_icon_button(actions, "●", "Показать статус", self.refresh_status)
         self.plan_btn = self._make_icon_button(actions, "☷", "Построить dry-run план", self.build_plan)
-        self.no_push_btn = self._make_icon_button(actions, "▶", "Запустить конвейер без push", lambda: self.start_pipeline(True))
+        self.start_btn = self._make_icon_button(actions, "▶", "Запустить конвейер с push по плану", lambda: self.start_pipeline(False))
+        self.no_push_btn = self._make_icon_button(actions, "⊘", "Запустить конвейер без push", lambda: self.start_pipeline(True))
         self.upgrade_btn = self._make_icon_button(actions, "⇧", "Безопасно обновить структуру workspace", self.upgrade_workspace)
         self.reset_btn = self._make_icon_button(actions, "↺", "Reset project: git reset --hard + git clean", self.reset_project)
         self.report_btn = self._make_icon_button(actions, "☰", "Открыть последний отчёт", self.open_report)
@@ -612,6 +613,7 @@ class DevctlGui(tk.Tk):
             self.init_btn,
             self.status_btn,
             self.plan_btn,
+            self.start_btn,
             self.no_push_btn,
             self.upgrade_btn,
             self.reset_btn,
@@ -700,6 +702,14 @@ class DevctlGui(tk.Tk):
         action = actions.get(self.recommended_action_code, self.refresh_status)
         action()
 
+    @staticmethod
+    def _workspace_upgrade_details(workspace_config: dict) -> str:
+        missing = []
+        missing.extend(workspace_config.get("missingFields") or [])
+        missing.extend(workspace_config.get("missingArchiveExcludes") or [])
+        missing.extend(workspace_config.get("missingDirs") or [])
+        return ", ".join(str(item) for item in missing[:8]) or "структура workspace устарела"
+
     def _recommend_from_status(self, data: dict) -> None:
         workspace = data.get("workspace", {}) if isinstance(data.get("workspace"), dict) else {}
         git = data.get("git", {}) if isinstance(data.get("git"), dict) else {}
@@ -709,21 +719,8 @@ class DevctlGui(tk.Tk):
         project_root = workspace.get("projectRoot") or "project/"
         patches_dir = workspace.get("patchesDir") or "patches/"
         workspace_config = data.get("workspaceConfig", {}) if isinstance(data.get("workspaceConfig"), dict) else {}
-
-        if workspace.get("projectExists") and workspace_config.get("upgradeAvailable"):
-            missing = []
-            missing.extend(workspace_config.get("missingFields") or [])
-            missing.extend(workspace_config.get("missingArchiveExcludes") or [])
-            missing.extend(workspace_config.get("missingDirs") or [])
-            details = ", ".join(str(item) for item in missing[:8]) or "структура workspace устарела"
-            self._set_next_action(
-                "upgrade_workspace",
-                "Безопасно обновить структуру workspace",
-                f"devctl видит, что workspace можно актуализировать: {details}. Команда init --upgrade не трогает project/ и пользовательские пути, а только добавляет недостающую инфраструктуру.",
-                "Обновить структуру workspace",
-                "warn",
-            )
-            return
+        upgrade_available = bool(workspace.get("projectExists") and workspace_config.get("upgradeAvailable"))
+        upgrade_details = self._workspace_upgrade_details(workspace_config)
 
         if not workspace.get("projectExists"):
             self._set_next_action(
@@ -774,6 +771,14 @@ class DevctlGui(tk.Tk):
                     "Открыть последний отчёт",
                     "ok",
                 )
+            elif upgrade_available:
+                self._set_next_action(
+                    "upgrade_workspace",
+                    "Безопасно обновить структуру workspace",
+                    f"devctl видит, что workspace можно актуализировать: {upgrade_details}. Команда init --upgrade не трогает project/ и пользовательские пути, а только добавляет недостающую инфраструктуру.",
+                    "Обновить структуру workspace",
+                    "warn",
+                )
             else:
                 self._set_next_action(
                     "open_patches",
@@ -795,10 +800,13 @@ class DevctlGui(tk.Tk):
             return
 
         title = latest.get("title") or latest.get("name") or "следующий патч"
+        upgrade_note = ""
+        if upgrade_available:
+            upgrade_note = f" Дополнительно devctl предлагает обновить структуру workspace: {upgrade_details}. Это не блокирует построение плана и запуск патча."
         self._set_next_action(
             "build_plan",
             "Построить прозрачный план запуска",
-            f"Workspace выглядит готовым. Следующий патч: {title}. Перед запуском лучше посмотреть dry-run план: файлы, проверки, commit и push.",
+            f"Workspace выглядит готовым. Следующий патч: {title}. Перед запуском лучше посмотреть dry-run план: файлы, проверки, commit и push.{upgrade_note}",
             "Построить план",
             "ok",
         )
@@ -1402,7 +1410,7 @@ class DevctlGui(tk.Tk):
 
     def set_running(self, running: bool) -> None:
         state = "disabled" if running else "normal"
-        for widget in (self.main_button, self.no_push_btn, self.status_btn, self.plan_btn, self.init_btn, self.init_top_btn, self.upgrade_btn, self.reset_btn, self.report_btn, self.archives_btn, self.uts_btn, self.project_btn, self.copy_output_btn, self.copy_prompt_btn):
+        for widget in (self.main_button, self.start_btn, self.no_push_btn, self.status_btn, self.plan_btn, self.init_btn, self.init_top_btn, self.upgrade_btn, self.reset_btn, self.report_btn, self.archives_btn, self.uts_btn, self.project_btn, self.copy_output_btn, self.copy_prompt_btn):
             widget.configure(state=state)
 
     def _on_start_done(self, result: RunResult) -> None:
