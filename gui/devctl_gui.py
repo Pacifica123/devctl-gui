@@ -17,8 +17,8 @@ except ImportError:  # запуск как python -m gui.devctl_gui
     from .devctl_runner import DevctlRunner, RunResult  # type: ignore
 
 APP_NAME = "devctl GUI"
-APP_VERSION = "0.2.3"
-BUNDLED_DEVCTL_VERSION = "0.6.4"
+APP_VERSION = "0.2.4"
+BUNDLED_DEVCTL_VERSION = "0.6.5"
 
 
 PATCH_PROMPT_TEMPLATE = """Ты работаешь с devctl workspace и должен вернуть не полный архив проекта, а полноценный devctl-патч.
