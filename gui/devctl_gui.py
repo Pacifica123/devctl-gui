@@ -17,8 +17,8 @@ except ImportError:  # запуск как python -m gui.devctl_gui
     from .devctl_runner import DevctlRunner, RunResult  # type: ignore
 
 APP_NAME = "devctl GUI"
-APP_VERSION = "0.2.5"
-BUNDLED_DEVCTL_VERSION = "0.6.5"
+APP_VERSION = "0.2.6"
+BUNDLED_DEVCTL_VERSION = "0.6.6"
 
 
 PATCH_PROMPT_TEMPLATE = """Ты работаешь с devctl workspace и должен вернуть не полный архив проекта, а полноценный devctl-патч.
@@ -1242,7 +1242,11 @@ class DevctlGui(tk.Tk):
             kind = "bad" if latest.get("manifestError") else "ok"
             self.cards["patch"].set(latest.get("title") or latest.get("name") or "найден", kind)
         else:
-            self.cards["patch"].set("нет патчей", "warn")
+            patches = data.get("patches", {}) if isinstance(data.get("patches"), dict) else {}
+            if patches.get("count"):
+                self.cards["patch"].set("нет новых", "ok")
+            else:
+                self.cards["patch"].set("нет патчей", "warn")
         if workspace.get("userTestSpaceDirExists"):
             self.cards["uts"].set("готов", "ok")
         else:
@@ -1305,7 +1309,10 @@ class DevctlGui(tk.Tk):
                 f"Манифест: {latest.get('manifestError') or 'OK'}",
             ])
         else:
-            lines.append("Zip-файлы патчей не найдены.")
+            if patches.get("count"):
+                lines.append("Неприменённых patch.zip не найдено; все кандидаты уже применены или видны в Git-трейлерах.")
+            else:
+                lines.append("Zip-файлы патчей не найдены.")
         return "\n".join(lines) + "\n"
 
     def _format_plan(self, data: dict, result: RunResult) -> str:
