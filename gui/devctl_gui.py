@@ -17,8 +17,8 @@ except ImportError:  # запуск как python -m gui.devctl_gui
     from .devctl_runner import DevctlRunner, RunResult  # type: ignore
 
 APP_NAME = "devctl GUI"
-APP_VERSION = "0.2.6"
-BUNDLED_DEVCTL_VERSION = "0.6.6"
+APP_VERSION = "0.2.7"
+BUNDLED_DEVCTL_VERSION = "0.6.7"
 
 
 PATCH_PROMPT_TEMPLATE = """Ты работаешь с devctl workspace и должен вернуть не полный архив проекта, а полноценный devctl-патч.
@@ -598,6 +598,7 @@ class DevctlGui(tk.Tk):
         actions.pack(fill="x", pady=(0, 8))
         self.init_btn = self._make_icon_button(actions, "＋", "Инициализировать workspace", self.init_workspace)
         self.status_btn = self._make_icon_button(actions, "●", "Показать статус", self.refresh_status)
+        self.sync_btn = self._make_icon_button(actions, "⇄", "Синхронизировать workspace с GitHub: project -> archives -> UTS", self.sync_workspace)
         self.plan_btn = self._make_icon_button(actions, "☷", "Построить dry-run план", self.build_plan)
         self.start_btn = self._make_icon_button(actions, "▶", "Запустить конвейер с push по плану", lambda: self.start_pipeline(False))
         self.no_push_btn = self._make_icon_button(actions, "⊘", "Запустить конвейер без push", lambda: self.start_pipeline(True))
@@ -612,6 +613,7 @@ class DevctlGui(tk.Tk):
         self.action_buttons = (
             self.init_btn,
             self.status_btn,
+            self.sync_btn,
             self.plan_btn,
             self.start_btn,
             self.no_push_btn,
@@ -688,6 +690,7 @@ class DevctlGui(tk.Tk):
             "init_workspace": self.init_workspace,
             "choose_workspace": self.choose_workspace,
             "refresh_status": self.refresh_status,
+            "sync_workspace": self.sync_workspace,
             "open_patches": self.open_patches,
             "open_project": self.open_project,
             "show_git_status": self.show_git_status,
@@ -781,11 +784,11 @@ class DevctlGui(tk.Tk):
                 )
             else:
                 self._set_next_action(
-                    "open_patches",
-                    "Добавить patch.zip в очередь",
-                    f"Патчи не найдены. Поместите следующий devctl-патч в папку: {patches_dir}",
-                    "Открыть patches/",
-                    "warn",
+                    "sync_workspace",
+                    "Синхронизировать workspace с GitHub",
+                    "Неприменённых патчей нет. Можно одной кнопкой привести project/ к актуальному origin/ветке, затем создать свежий архив в archives/ и развернуть копию в UserTestSpace/. Для нового патча по-прежнему можно открыть patches/ нижней кнопкой.",
+                    "Sync from GitHub",
+                    "ok",
                 )
             return
 
@@ -1083,6 +1086,97 @@ class DevctlGui(tk.Tk):
         lines.extend([f"- {item}" for item in errors] or ["нет"])
         return "\n".join(lines) + "\n"
 
+    def sync_workspace(self) -> None:
+        self._save_workspace()
+        proceed = messagebox.askyesno(
+            APP_NAME,
+            "Синхронизировать workspace с GitHub как источником истины?\n\n"
+            "GUI вызовет `devctl sync --discard-local --json`: project/ будет приведён к origin/ветке через fetch + reset --hard + git clean, затем devctl создаст свежий архив в archives/ и развернёт копию в UserTestSpace/.\n\n"
+            "Локальные незакоммиченные изменения и локальные commit'ы, которых нет в remote, могут быть отброшены.",
+            parent=self,
+        )
+        if not proceed:
+            return
+        self.set_running(True)
+        self.set_text(
+            self.report_text,
+            "Синхронизирую workspace с GitHub как источником истины...\n\n"
+            "Команда: devctl sync --discard-local --json\n"
+            "Этапы: fetch/reset/clean -> свежий archives/ snapshot -> свежий UserTestSpace/.\n",
+        )
+        self.notebook.select(2)
+        self._run_async(["sync", "--discard-local", "--json"], self._on_sync_workspace_done, timeout=900)
+
+    def _on_sync_workspace_done(self, result: RunResult) -> None:
+        self.set_running(False)
+        data = result.json_data or {}
+        if isinstance(data, dict):
+            archive = data.get("archive") if isinstance(data.get("archive"), dict) else {}
+            uts = data.get("uts") if isinstance(data.get("uts"), dict) else {}
+            self.last_archive_path = archive.get("path") or self.last_archive_path
+            self.last_uts_path = uts.get("projectDir") or self.last_uts_path
+            self.set_text(self.report_text, self._format_sync_result(data, result))
+        else:
+            self.set_text(self.report_text, result.stdout + ("\n" + result.stderr if result.stderr else ""))
+        self.notebook.select(2)
+        self.refresh_status()
+        if result.ok and isinstance(data, dict) and data.get("ok"):
+            messagebox.showinfo(APP_NAME, "Workspace синхронизирован: project, archives и UserTestSpace актуализированы.", parent=self)
+        else:
+            messagebox.showerror(APP_NAME, "Не удалось синхронизировать workspace. Подробности во вкладке «Отчёт».", parent=self)
+
+    def _format_sync_result(self, data: dict, result: RunResult) -> str:
+        if not data:
+            return (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
+        workspace = data.get("workspace") if isinstance(data.get("workspace"), dict) else {}
+        git = data.get("git") if isinstance(data.get("git"), dict) else {}
+        archive = data.get("archive") if isinstance(data.get("archive"), dict) else {}
+        uts = data.get("uts") if isinstance(data.get("uts"), dict) else {}
+        lines = [
+            "== sync workspace ==",
+            f"Статус: {'OK' if data.get('ok') else 'ошибка'}",
+            f"Код возврата: {result.returncode}",
+            f"Workspace: {workspace.get('workspaceRoot') or 'неизвестно'}",
+            f"Project: {workspace.get('projectRoot') or 'неизвестно'}",
+            "",
+            "== git ==",
+            f"Remote: {git.get('remote') or 'origin'}",
+            f"Remote URL: {git.get('remoteUrl') or 'не задан'}",
+            f"Ветка: {git.get('branch') or 'неизвестно'}",
+            f"Discard local: {git.get('discardLocal')}",
+            f"Head after: {git.get('headAfter') or 'нет'}",
+            f"Clean after: {git.get('cleanAfter')}",
+            "",
+            "== git-шаги ==",
+        ]
+        operations = git.get("operations") or []
+        lines.extend([f"- {item}" for item in operations] or ["нет"])
+        lines.extend([
+            "",
+            "== archives / UTS ==",
+            f"Архив: {archive.get('path') or 'не создавался'}",
+            f"Файлов в архиве: {archive.get('fileCount', 0)}",
+            f"UTS project: {uts.get('projectDir') or 'не обновлялся'}",
+            "",
+            "== создано ==",
+        ])
+        created = data.get("created") or []
+        lines.extend([f"- {item}" for item in created] or ["служебные папки уже существовали"])
+        warnings = []
+        warnings.extend(data.get("warnings") or [])
+        warnings.extend(git.get("warnings") or [])
+        lines.append("")
+        lines.append("== предупреждения ==")
+        lines.extend([f"- {item}" for item in warnings] or ["нет"])
+        errors = []
+        if data.get("error"):
+            errors.append(data.get("error"))
+        errors.extend(git.get("errors") or [])
+        lines.append("")
+        lines.append("== ошибки ==")
+        lines.extend([f"- {item}" for item in errors] or ["нет"])
+        return "\n".join(lines) + "\n"
+
     def upgrade_workspace(self) -> None:
         self._save_workspace()
         proceed = messagebox.askyesno(
@@ -1190,13 +1284,13 @@ class DevctlGui(tk.Tk):
             save_config(self.config_data)
         self.runner.set_workspace(workspace)
 
-    def _run_async(self, args: list[str], callback, *, runner: DevctlRunner | None = None, save_workspace: bool = True) -> None:
+    def _run_async(self, args: list[str], callback, *, runner: DevctlRunner | None = None, save_workspace: bool = True, timeout: int = 180) -> None:
         if save_workspace:
             self._save_workspace()
         active_runner = runner or self.runner
 
         def worker() -> None:
-            result = active_runner.run(args, timeout=180)
+            result = active_runner.run(args, timeout=timeout)
             self.events.put(("result", (callback, result)))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1294,6 +1388,8 @@ class DevctlGui(tk.Tk):
             f"Репозиторий: {git.get('isRepository')}",
             f"Ветка: {git.get('branch') or 'неизвестно'}",
             f"Рабочее дерево: {'чистое' if git.get('clean') else 'есть изменения/неизвестно'}",
+            f"Remote origin: {git.get('remoteUrl') or 'не задан'}",
+            f"Ahead/behind: {((git.get('aheadBehind') or {}).get('ahead'))}/{((git.get('aheadBehind') or {}).get('behind'))}",
             f"Ошибка: {git.get('error') or 'нет'}",
             "",
             "== патчи ==",
@@ -1417,7 +1513,7 @@ class DevctlGui(tk.Tk):
 
     def set_running(self, running: bool) -> None:
         state = "disabled" if running else "normal"
-        for widget in (self.main_button, self.start_btn, self.no_push_btn, self.status_btn, self.plan_btn, self.init_btn, self.init_top_btn, self.upgrade_btn, self.reset_btn, self.report_btn, self.archives_btn, self.uts_btn, self.project_btn, self.copy_output_btn, self.copy_prompt_btn):
+        for widget in (self.main_button, self.start_btn, self.no_push_btn, self.status_btn, self.sync_btn, self.plan_btn, self.init_btn, self.init_top_btn, self.upgrade_btn, self.reset_btn, self.report_btn, self.archives_btn, self.uts_btn, self.project_btn, self.copy_output_btn, self.copy_prompt_btn):
             widget.configure(state=state)
 
     def _on_start_done(self, result: RunResult) -> None:
