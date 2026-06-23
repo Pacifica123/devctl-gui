@@ -12,10 +12,12 @@ from typing import Callable
 
 try:
     from PySide6 import QtCore, QtGui, QtWidgets
+    from PySide6 import QtSvg
 except Exception as exc:  # Qt не нужен в --devctl-child, поэтому GUI проверяет это в main().
     QtCore = None  # type: ignore[assignment]
     QtGui = None  # type: ignore[assignment]
     QtWidgets = None  # type: ignore[assignment]
+    QtSvg = None  # type: ignore[assignment]
     QT_IMPORT_ERROR: Exception | None = exc
 else:
     QT_IMPORT_ERROR = None
@@ -26,7 +28,7 @@ except ImportError:  # запуск как python -m gui.devctl_gui
     from .devctl_runner import DevctlRunner, RunResult  # type: ignore
 
 APP_NAME = "devctl GUI"
-APP_VERSION = "0.5.1"
+APP_VERSION = "0.5.2"
 BUNDLED_DEVCTL_VERSION = "0.7.0"
 
 PATCH_PROMPT_TEMPLATE = """Ты работаешь с devctl workspace и должен вернуть не полный архив проекта, а полноценный devctl-патч.
@@ -211,6 +213,45 @@ def app_config_path() -> Path:
 
 def looks_like_pyinstaller_temp(path: Path) -> bool:
     return any(part.upper().startswith("_MEI") for part in path.parts)
+
+
+def devctl_global_config_path() -> Path:
+    if os.name == "nt":
+        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+        return base / "devctl" / "config.json"
+    return Path.home() / ".config" / "devctl" / "config.json"
+
+
+def load_devctl_global_config() -> dict:
+    path = devctl_global_config_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def registered_workspaces() -> list[dict]:
+    records = load_devctl_global_config().get("workspaces")
+    if not isinstance(records, list):
+        return []
+    result: list[dict] = []
+    seen: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        path = str(record.get("path") or "").strip()
+        if not path:
+            continue
+        try:
+            normalized = str(Path(path).expanduser().resolve()).casefold()
+        except Exception:
+            normalized = path.casefold()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(record)
+    return result
 
 
 def initial_workspace(config_data: dict) -> str:
@@ -611,6 +652,7 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
         self.last_uts_path: str | None = None
         self.recommended_action_code = "refresh_status"
         self._text_tabs: list[tuple[str, QtWidgets.QPlainTextEdit]] = []
+        self._workspace_combo_updating = False
 
         self.config_data = load_config()
         default_workspace = initial_workspace(self.config_data)
@@ -618,6 +660,7 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
 
         self._setup_styles()
         self._build_ui(default_workspace)
+        self.refresh_registered_workspaces()
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self._drain_events)
         self._timer.start(100)
@@ -703,13 +746,33 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
             QLabel#NextActionTitle[kind="warn"] {{ color: {c['warn']}; }}
             QLabel#NextActionTitle[kind="bad"] {{ color: {c['bad']}; }}
             QLabel#NextActionBody {{ color: {c['text']}; }}
-            QLineEdit {{
+            QLineEdit, QComboBox {{
                 background: {c['entry']};
                 color: {c['text']};
                 border: 1px solid {c['border']};
                 border-radius: 10px;
                 padding: 8px 10px;
                 selection-background-color: {c['select']};
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 26px;
+            }}
+            QComboBox::down-arrow {{
+                image: none;
+                border-left: 5px solid transparent;
+                border-right: 5px solid transparent;
+                border-top: 6px solid {c['muted']};
+                width: 0;
+                height: 0;
+                margin-right: 8px;
+            }}
+            QComboBox QAbstractItemView {{
+                background: {c['panel']};
+                color: {c['text']};
+                border: 1px solid {c['border']};
+                selection-background-color: {c['select']};
+                padding: 4px;
             }}
             QPushButton {{
                 background: {c['button']};
@@ -806,162 +869,37 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
         """)
 
     def _flat_icon(self, name: str) -> QtGui.QIcon:
-        """Small flat vector icons for the dark Qt toolbar.
+        """Return an app-owned flat SVG icon for the toolbar.
 
-        Qt standard icons look native only in classic desktop themes. The GUI uses
-        a custom flat style, so toolbar glyphs are drawn as simple anti-aliased
-        shapes to stay readable, colourful and independent from the OS icon pack.
+        The previous GUI versions used either OS standard icons or QPainter
+        glyphs. Standard icons look inconsistent on Windows dark themes, while
+        code-drawn glyphs are hard to audit and tune. SVG assets are a cleaner
+        middle ground: they are local, theme-independent, editable, flat, and
+        bundled into the EXE by PyInstaller.
         """
-        size = 28
-        pixmap = QtGui.QPixmap(size, size)
-        pixmap.fill(QtCore.Qt.GlobalColor.transparent)
-        painter = QtGui.QPainter(pixmap)
-        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        icon_path = bundled_root() / "gui" / "assets" / "icons" / f"{name}.svg"
+        if icon_path.exists():
+            return QtGui.QIcon(str(icon_path))
+        fallback = {
+            "init": QtWidgets.QStyle.StandardPixmap.SP_FileDialogNewFolder,
+            "status": QtWidgets.QStyle.StandardPixmap.SP_DialogApplyButton,
+            "settings": QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView,
+            "sync": QtWidgets.QStyle.StandardPixmap.SP_BrowserReload,
+            "inbox": QtWidgets.QStyle.StandardPixmap.SP_ArrowDown,
+            "plan": QtWidgets.QStyle.StandardPixmap.SP_FileDialogContentsView,
+            "start": QtWidgets.QStyle.StandardPixmap.SP_MediaPlay,
+            "no_push": QtWidgets.QStyle.StandardPixmap.SP_MediaPlay,
+            "upgrade": QtWidgets.QStyle.StandardPixmap.SP_ArrowUp,
+            "reset": QtWidgets.QStyle.StandardPixmap.SP_ArrowBack,
+            "report": QtWidgets.QStyle.StandardPixmap.SP_FileIcon,
+            "archives": QtWidgets.QStyle.StandardPixmap.SP_DirIcon,
+            "uts": QtWidgets.QStyle.StandardPixmap.SP_ComputerIcon,
+            "project": QtWidgets.QStyle.StandardPixmap.SP_DirHomeIcon,
+            "copy": QtWidgets.QStyle.StandardPixmap.SP_FileDialogListView,
+            "prompt": QtWidgets.QStyle.StandardPixmap.SP_DialogHelpButton,
+        }.get(name, QtWidgets.QStyle.StandardPixmap.SP_FileIcon)
+        return self.style().standardIcon(fallback)
 
-        palette = {
-            "init": ("#f2cc60", "#3fb950"),
-            "status": ("#58a6ff", "#79c0ff"),
-            "settings": ("#c9d1d9", "#58a6ff"),
-            "sync": ("#58a6ff", "#3fb950"),
-            "inbox": ("#79c0ff", "#f2cc60"),
-            "plan": ("#e6edf3", "#a5d6ff"),
-            "start": ("#3fb950", "#56d364"),
-            "no_push": ("#f85149", "#ff7b72"),
-            "upgrade": ("#a371f7", "#d2a8ff"),
-            "reset": ("#58a6ff", "#79c0ff"),
-            "report": ("#e6edf3", "#8b949e"),
-            "archives": ("#f2cc60", "#d29922"),
-            "uts": ("#79c0ff", "#58a6ff"),
-            "project": ("#e6edf3", "#f2cc60"),
-            "copy": ("#a5d6ff", "#58a6ff"),
-            "prompt": ("#d2a8ff", "#f2cc60"),
-        }
-        primary, secondary = palette.get(name, ("#c9d1d9", "#58a6ff"))
-        pcolor = QtGui.QColor(primary)
-        scolor = QtGui.QColor(secondary)
-        fill = QtGui.QColor(primary)
-        fill.setAlpha(64)
-        soft = QtGui.QColor(secondary)
-        soft.setAlpha(90)
-
-        pen = QtGui.QPen(pcolor, 2.2, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap, QtCore.Qt.PenJoinStyle.RoundJoin)
-        painter.setPen(pen)
-        painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
-
-        def draw_doc(x: float = 8, y: float = 5, w: float = 12, h: float = 17) -> None:
-            painter.setPen(QtGui.QPen(pcolor, 1.8, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap, QtCore.Qt.PenJoinStyle.RoundJoin))
-            painter.setBrush(fill)
-            painter.drawRoundedRect(QtCore.QRectF(x, y, w, h), 2.5, 2.5)
-            painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
-            painter.drawLine(QtCore.QPointF(x + 3, y + 7), QtCore.QPointF(x + w - 3, y + 7))
-            painter.drawLine(QtCore.QPointF(x + 3, y + 11), QtCore.QPointF(x + w - 3, y + 11))
-
-        def draw_folder(x: float = 4, y: float = 8, w: float = 20, h: float = 13) -> None:
-            path = QtGui.QPainterPath()
-            path.moveTo(x, y + 4)
-            path.lineTo(x + 6, y + 4)
-            path.lineTo(x + 8, y)
-            path.lineTo(x + 14, y)
-            path.lineTo(x + 16, y + 4)
-            path.lineTo(x + w, y + 4)
-            path.lineTo(x + w, y + h)
-            path.lineTo(x, y + h)
-            path.closeSubpath()
-            painter.setBrush(fill)
-            painter.setPen(QtGui.QPen(pcolor, 1.8, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap, QtCore.Qt.PenJoinStyle.RoundJoin))
-            painter.drawPath(path)
-            painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
-
-        def arrow_head(points: list[tuple[float, float]], color: QtGui.QColor | None = None) -> None:
-            painter.setPen(QtCore.Qt.PenStyle.NoPen)
-            painter.setBrush(color or pcolor)
-            painter.drawPolygon(QtGui.QPolygonF([QtCore.QPointF(x, y) for x, y in points]))
-            painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
-            painter.setPen(pen)
-
-        if name == "init":
-            draw_folder()
-            painter.setPen(QtGui.QPen(scolor, 2.4, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap))
-            painter.drawLine(QtCore.QPointF(19, 10), QtCore.QPointF(19, 18))
-            painter.drawLine(QtCore.QPointF(15, 14), QtCore.QPointF(23, 14))
-        elif name in {"status", "reset"}:
-            painter.setPen(QtGui.QPen(pcolor, 2.2, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap))
-            painter.drawArc(QtCore.QRectF(6, 6, 16, 16), 35 * 16, 280 * 16)
-            arrow_head([(20, 6), (23, 10), (18, 10)], scolor)
-            if name == "reset":
-                painter.setPen(QtGui.QPen(scolor, 2.0, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap))
-                painter.drawLine(QtCore.QPointF(10, 9), QtCore.QPointF(7, 12))
-        elif name == "settings":
-            painter.setPen(QtGui.QPen(pcolor, 2.0, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap))
-            for y, knob_x in ((8, 12), (14, 18), (20, 9)):
-                painter.drawLine(QtCore.QPointF(6, y), QtCore.QPointF(22, y))
-                painter.setBrush(scolor)
-                painter.drawEllipse(QtCore.QPointF(knob_x, y), 2.4, 2.4)
-                painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
-        elif name == "sync":
-            painter.setPen(QtGui.QPen(pcolor, 2.2, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap))
-            painter.drawLine(QtCore.QPointF(7, 10), QtCore.QPointF(20, 10))
-            arrow_head([(20, 6.5), (24, 10), (20, 13.5)], pcolor)
-            painter.setPen(QtGui.QPen(scolor, 2.2, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap))
-            painter.drawLine(QtCore.QPointF(21, 18), QtCore.QPointF(8, 18))
-            arrow_head([(8, 14.5), (4, 18), (8, 21.5)], scolor)
-        elif name == "inbox":
-            painter.setPen(QtGui.QPen(pcolor, 2.0, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap))
-            painter.setBrush(fill)
-            painter.drawRoundedRect(QtCore.QRectF(5, 16, 18, 7), 2.5, 2.5)
-            painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
-            painter.drawLine(QtCore.QPointF(14, 5), QtCore.QPointF(14, 15))
-            arrow_head([(10, 12), (14, 17), (18, 12)], scolor)
-        elif name in {"plan", "report"}:
-            draw_doc()
-            if name == "plan":
-                painter.setPen(QtGui.QPen(scolor, 2.2, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap))
-                painter.drawEllipse(QtCore.QPointF(18.5, 18.5), 2.2, 2.2)
-        elif name == "start":
-            painter.setPen(QtCore.Qt.PenStyle.NoPen)
-            painter.setBrush(scolor)
-            painter.drawPolygon(QtGui.QPolygonF([QtCore.QPointF(10, 7), QtCore.QPointF(21, 14), QtCore.QPointF(10, 21)]))
-        elif name == "no_push":
-            painter.setPen(QtGui.QPen(pcolor, 2.5, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap))
-            painter.drawLine(QtCore.QPointF(9, 9), QtCore.QPointF(19, 19))
-            painter.drawLine(QtCore.QPointF(19, 9), QtCore.QPointF(9, 19))
-        elif name == "upgrade":
-            painter.setPen(QtGui.QPen(pcolor, 2.4, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap))
-            painter.drawLine(QtCore.QPointF(14, 21), QtCore.QPointF(14, 8))
-            arrow_head([(9, 11), (14, 5), (19, 11)], scolor)
-        elif name == "archives":
-            draw_folder()
-        elif name == "uts":
-            painter.setPen(QtGui.QPen(pcolor, 1.9, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap, QtCore.Qt.PenJoinStyle.RoundJoin))
-            painter.setBrush(fill)
-            painter.drawRoundedRect(QtCore.QRectF(5, 6, 18, 13), 2.5, 2.5)
-            painter.setBrush(scolor)
-            painter.drawRoundedRect(QtCore.QRectF(10, 21, 8, 2), 1, 1)
-        elif name == "project":
-            painter.setPen(QtGui.QPen(pcolor, 2.0, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap, QtCore.Qt.PenJoinStyle.RoundJoin))
-            painter.setBrush(fill)
-            painter.drawPolygon(QtGui.QPolygonF([QtCore.QPointF(6, 13), QtCore.QPointF(14, 6), QtCore.QPointF(22, 13), QtCore.QPointF(22, 22), QtCore.QPointF(8, 22), QtCore.QPointF(8, 13)]))
-            painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
-        elif name == "copy":
-            painter.setPen(QtGui.QPen(pcolor, 1.8, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap, QtCore.Qt.PenJoinStyle.RoundJoin))
-            painter.setBrush(soft)
-            painter.drawRoundedRect(QtCore.QRectF(7, 7, 10, 12), 2, 2)
-            painter.setBrush(fill)
-            painter.drawRoundedRect(QtCore.QRectF(11, 10, 10, 12), 2, 2)
-        elif name == "prompt":
-            painter.setPen(QtGui.QPen(pcolor, 2.2, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap))
-            painter.drawLine(QtCore.QPointF(8, 20), QtCore.QPointF(20, 8))
-            painter.setPen(QtGui.QPen(scolor, 1.7, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap))
-            painter.drawLine(QtCore.QPointF(8, 7), QtCore.QPointF(8, 12))
-            painter.drawLine(QtCore.QPointF(5.5, 9.5), QtCore.QPointF(10.5, 9.5))
-            painter.drawLine(QtCore.QPointF(21, 17), QtCore.QPointF(21, 22))
-            painter.drawLine(QtCore.QPointF(18.5, 19.5), QtCore.QPointF(23.5, 19.5))
-        else:
-            painter.setBrush(fill)
-            painter.drawEllipse(QtCore.QPointF(14, 14), 7, 7)
-
-        painter.end()
-        return QtGui.QIcon(pixmap)
 
     def _make_tool_button(self, icon_name: str, tooltip: str, command: Callable) -> QtWidgets.QToolButton:
         button = QtWidgets.QToolButton()
@@ -995,6 +933,11 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
         path_row = QtWidgets.QHBoxLayout()
         self.path_entry = QtWidgets.QLineEdit(default_workspace)
         path_row.addWidget(self.path_entry, 1)
+        self.workspace_combo = QtWidgets.QComboBox()
+        self.workspace_combo.setMinimumWidth(240)
+        self.workspace_combo.setToolTip("Быстрый выбор workspace из глобального devctl registry")
+        self.workspace_combo.activated.connect(lambda _index=0: self._guard(self.choose_registered_workspace))
+        path_row.addWidget(self.workspace_combo)
         choose_btn = QtWidgets.QPushButton("Выбрать")
         choose_btn.clicked.connect(lambda: self._guard(self.choose_workspace))
         self.init_top_btn = QtWidgets.QPushButton("Новый workspace")
@@ -1327,6 +1270,7 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
         if ok:
             self._set_next_action("grab_inbox_patch", "Patch Inbox настроен", "Склад патчей и registry workspace обновлены. Теперь можно положить patch.zip в incoming/ и забрать его кнопкой Patch Inbox.", "Забрать патч из склада", "ok")
             QtWidgets.QMessageBox.information(self, APP_NAME, "Настройки Patch Inbox сохранены.")
+            self.refresh_registered_workspaces()
             self.refresh_status()
         else:
             self._set_next_action("configure_patch_inbox", "Настройки Patch Inbox не сохранены полностью", "Проверьте отчёт: одна из команд завершилась с ошибкой.", "Открыть настройки", "bad")
@@ -1355,12 +1299,63 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
                 lines.append(result.stderr.strip())
         return "\n".join(lines) + "\n"
 
+    def refresh_registered_workspaces(self) -> None:
+        """Refresh the quick workspace switcher from devctl global config."""
+        combo = getattr(self, "workspace_combo", None)
+        if combo is None:
+            return
+        current_text = self.path_entry.text().strip() if hasattr(self, "path_entry") else ""
+        try:
+            current_path = str(Path(current_text).expanduser().resolve()).casefold() if current_text else ""
+        except Exception:
+            current_path = current_text.casefold()
+        records = registered_workspaces()
+        self._workspace_combo_updating = True
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("workspace registry", "")
+        combo.setItemData(0, "Быстрый выбор workspace из ~/.config/devctl/config.json / %APPDATA%\\devctl\\config.json", QtCore.Qt.ItemDataRole.ToolTipRole)
+        selected_index = 0
+        for record in records:
+            path = str(record.get("path") or "").strip()
+            if not path:
+                continue
+            name = str(record.get("name") or record.get("id") or Path(path).name or "workspace")
+            wid = str(record.get("id") or "").strip()
+            label = f"{name} · {wid}" if wid and wid != name else name
+            combo.addItem(label, path)
+            combo.setItemData(combo.count() - 1, path, QtCore.Qt.ItemDataRole.ToolTipRole)
+            try:
+                normalized = str(Path(path).expanduser().resolve()).casefold()
+            except Exception:
+                normalized = path.casefold()
+            if normalized == current_path:
+                selected_index = combo.count() - 1
+        combo.setCurrentIndex(selected_index)
+        combo.setEnabled(bool(records))
+        combo.blockSignals(False)
+        self._workspace_combo_updating = False
+
+    def choose_registered_workspace(self) -> None:
+        combo = getattr(self, "workspace_combo", None)
+        if combo is None or self._workspace_combo_updating:
+            return
+        path = str(combo.currentData() or "").strip()
+        if not path:
+            return
+        self.path_entry.setText(path)
+        self._save_workspace()
+        self.refresh_registered_workspaces()
+        self.refresh_status()
+
+
     def choose_workspace(self) -> None:
         selected = QtWidgets.QFileDialog.getExistingDirectory(self, "Выберите корень рабочей области devctl")
         if not selected:
             return
         self.path_entry.setText(selected)
         self._save_workspace()
+        self.refresh_registered_workspaces()
         self.refresh_status()
 
     def init_workspace(self) -> None:
@@ -1399,6 +1394,7 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
         if result.ok and isinstance(data, dict) and data.get("ok"):
             self.path_entry.setText(str(workspace))
             self._save_workspace()
+            self.refresh_registered_workspaces()
             self.last_report_path = None
             self.last_archive_path = None
             self.refresh_status()
@@ -1782,6 +1778,8 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
     def set_running(self, running: bool) -> None:
         for widget in (self.main_button, *self.action_buttons, self.init_top_btn, self.settings_top_btn):
             widget.setEnabled(not running)
+        if hasattr(self, "workspace_combo"):
+            self.workspace_combo.setEnabled((not running) and registered_workspaces())
 
     def _on_start_done(self, result: RunResult) -> None:
         self.set_running(False)
@@ -1866,7 +1864,7 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
 def run_gui() -> int:
     if QT_IMPORT_ERROR is not None or QtWidgets is None:
         print(
-            "[ОШИБКА] devctl GUI v0.5.1 требует PySide6.\n"
+            "[ОШИБКА] devctl GUI v0.5.2 требует PySide6.\n"
             "Установите зависимость: python -m pip install PySide6\n"
             f"Исходная ошибка: {QT_IMPORT_ERROR}",
             file=sys.stderr,

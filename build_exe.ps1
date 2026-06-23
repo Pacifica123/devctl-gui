@@ -28,7 +28,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "pip install failed with exit code $LASTEXITCODE"
 }
 
-& $Python -c "from PySide6 import QtCore, QtGui, QtWidgets; import PyInstaller; print('PySide6', QtCore.__version__)"
+& $Python -c "from PySide6 import QtCore, QtGui, QtWidgets, QtSvg; import PyInstaller; print('PySide6', QtCore.__version__)"
 if ($LASTEXITCODE -ne 0) {
     throw "PySide6 smoke import failed with exit code $LASTEXITCODE"
 }

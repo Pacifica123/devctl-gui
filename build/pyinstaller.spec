@@ -25,7 +25,8 @@ release_dir.mkdir(exist_ok=True)
 # instead of PyInstaller's default dist/ directory.
 CONF["distpath"] = str(release_dir)
 
-icon_file = project_root / "gui" / "assets" / "icon.ico"
+assets_dir = project_root / "gui" / "assets"
+icon_file = assets_dir / "icon.ico"
 icon_arg = str(icon_file) if icon_file.exists() else None
 
 datas = [
@@ -33,8 +34,8 @@ datas = [
     # bundle root even if PyInstaller also discovers it as a hidden import.
     (str(project_root / "devctl.py"), "."),
 ]
-if icon_file.exists():
-    datas.append((str(icon_file), "gui/assets"))
+if assets_dir.exists():
+    datas.append((str(assets_dir), "gui/assets"))
 
 
 a = Analysis(
