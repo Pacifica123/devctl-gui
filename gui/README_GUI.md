@@ -1,6 +1,6 @@
 # devctl GUI для Windows
 
-GUI — тонкая оболочка поверх `devctl.py`: CLI остаётся ядром конвейера, а окно показывает статус, dry-run-план, live-лог запуска и ссылку на отчёт.
+GUI — тонкая Qt/PySide6-оболочка поверх `devctl.py`: CLI остаётся ядром конвейера, а окно показывает статус, dry-run-план, live-лог запуска и ссылку на отчёт.
 
 ## Что уже реализовано
 
@@ -65,7 +65,7 @@ python devctl.py reset --json
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip pyinstaller
+python -m pip install --upgrade pip pyinstaller PySide6
 pyinstaller build\pyinstaller.spec --clean --noconfirm
 ```
 
@@ -118,7 +118,7 @@ release/devctl-gui.exe
 
 ## v0.1.4: исправление запуска из GUI
 
-Исправлена ошибка подтверждения запуска: кнопка `Запустить конвейер` больше не падает внутри Tkinter-callback из-за неправильного вызова `messagebox.askyesno`. Если в будущем любой GUI-callback всё же упадёт, traceback будет показан во вкладке `Отчёт`, а не потеряется в невидимой консоли `.exe`.
+Историческое исправление Tkinter-версии: кнопка `Запустить конвейер` больше не падала внутри callback из-за неправильного вызова `messagebox.askyesno`. В Qt-версии v0.4.0 callback-ошибки также показываются во вкладке `Отчёт`, а не теряются в невидимой консоли `.exe`.
 
 ## Новое в v0.1.5
 
@@ -153,3 +153,11 @@ release/devctl-gui.exe
 ## Patch Inbox
 
 GUI v0.3.0 добавляет кнопку `⇩`: она вызывает `devctl inbox grab --json`, показывает результат импорта и после успешной доставки patch.zip предлагает построить dry-run план. Если target неясен, GUI запрашивает выбор зарегистрированного workspace.
+
+## Новое в v0.4.0
+
+- GUI перенесён с Tkinter на Qt/PySide6 без изменения рабочей модели: все команды по-прежнему идут через bundled `devctl.py` и `devctl_runner.py`.
+- Сохранены основные элементы интерфейса: выбор workspace, карточки состояния, блок следующего действия, icon-панель, вкладки `План` / `Запуск` / `Отчёт`, live-лог, Patch Inbox, мастер нового workspace, sync, reset, init --upgrade и открытие служебных папок.
+- Визуальная тема стала более опрятной: flat dark UI, округлённые карточки, кнопки и поля ввода, аккуратные вкладки и единый stylesheet.
+- Child-mode `--devctl-child` не зависит от Qt-инициализации, поэтому bundled EXE продолжает запускать CLI-ядро тем же способом.
+- Для запуска из исходников теперь нужен пакет `PySide6`; сборочный скрипт устанавливает его вместе с PyInstaller.

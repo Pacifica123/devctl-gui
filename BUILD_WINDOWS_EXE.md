@@ -3,7 +3,8 @@
 ## Требования
 
 - Windows 10/11.
-- Python 3.11+ с включённым `tkinter`.
+- Python 3.11+.
+- Python-пакеты `PySide6` и `pyinstaller` для сборки/запуска GUI из исходников.
 - Git for Windows, если нужен реальный `commit/push` из конвейера.
 
 ## Команды сборки
@@ -13,7 +14,7 @@
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip pyinstaller
+python -m pip install --upgrade pip pyinstaller PySide6
 pyinstaller build\pyinstaller.spec --clean --noconfirm
 ```
 
@@ -49,13 +50,17 @@ release/devctl-gui.exe
 ## CLI smoke-тесты перед сборкой
 
 ```powershell
-python -m py_compile devctl.py gui\devctl_runner.py gui\devctl_gui.py
+python -c "import ast,pathlib; [ast.parse(pathlib.Path(p).read_text(encoding='utf-8'), filename=p) for p in ['devctl.py','gui/devctl_runner.py','gui/devctl_gui.py']]"
 python devctl.py --help
 python devctl.py status --json
 python devctl.py plan --json
 python gui\devctl_gui.py --devctl-child . status --json
 python gui\devctl_gui.py --devctl-child . init --json --workspace .tmp-init-smoke --create-project --git-init --branch main
 ```
+
+## Qt/PySide6
+
+Начиная с GUI v0.4.0 окно реализовано на Qt через PySide6. Внешний сценарий работы, child-mode и команды devctl остались прежними, но runtime GUI теперь требует установленный PySide6 при запуске из исходников. В собранный PyInstaller EXE PySide6 упаковывается автоматически хуками PyInstaller.
 
 ## Как устроен bundled child-mode
 

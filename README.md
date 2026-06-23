@@ -138,3 +138,8 @@ patch_YYYYMMDD_HHMMSS_slug.zip
 - Старые workspace можно обновлять командой `python devctl.py init --upgrade`: она добавляет только недостающую инфраструктуру и не трогает содержимое `project/`.
 
 См. также подробную документацию в `docs/devctl-universal-v0.3-README.md` и примеры манифеста/рабочей области в `docs/`.
+
+
+## GUI v0.4.0: Qt/PySide6
+
+GUI перенесён с Tkinter на Qt/PySide6. Функциональные сценарии сохранены: status, plan, start, start --no-push, sync, reset, init --upgrade, Patch Inbox, мастер нового workspace, live-лог и открытие отчётов/архивов/UTS/project. Для запуска из исходников установите `PySide6`; `build_exe.ps1` делает это автоматически при сборке Windows EXE.

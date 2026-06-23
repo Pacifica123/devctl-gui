@@ -8,8 +8,17 @@ import sys
 import threading
 import traceback
 from pathlib import Path
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from typing import Callable
+
+try:
+    from PySide6 import QtCore, QtGui, QtWidgets
+except Exception as exc:  # Qt не нужен в --devctl-child, поэтому GUI проверяет это в main().
+    QtCore = None  # type: ignore[assignment]
+    QtGui = None  # type: ignore[assignment]
+    QtWidgets = None  # type: ignore[assignment]
+    QT_IMPORT_ERROR: Exception | None = exc
+else:
+    QT_IMPORT_ERROR = None
 
 try:
     from devctl_runner import DevctlRunner, RunResult
@@ -17,9 +26,8 @@ except ImportError:  # запуск как python -m gui.devctl_gui
     from .devctl_runner import DevctlRunner, RunResult  # type: ignore
 
 APP_NAME = "devctl GUI"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 BUNDLED_DEVCTL_VERSION = "0.7.0"
-
 
 PATCH_PROMPT_TEMPLATE = """Ты работаешь с devctl workspace и должен вернуть не полный архив проекта, а полноценный devctl-патч.
 
@@ -134,12 +142,9 @@ PATCH_SUMMARY.md должен объяснять:
 - если что-то не удалось проверить — честно указать.
 """
 
-def configure_standard_streams() -> None:
-    """Принудительно держим UTF-8 для child-процессов на Windows.
 
-    Без этого Windows PowerShell/GUI-процессы могут отдать русскоязычный JSON
-    в cp1251, а родительский GUI прочитает его как UTF-8 и покажет «����».
-    """
+def configure_standard_streams() -> None:
+    """Принудительно держим UTF-8 для child-процессов на Windows."""
     for stream_name in ("stdout", "stderr"):
         stream = getattr(sys, stream_name, None)
         reconfigure = getattr(stream, "reconfigure", None)
@@ -151,11 +156,7 @@ def configure_standard_streams() -> None:
 
 
 def bundled_root() -> Path:
-    """Где лежат devctl.py и bundled-ресурсы.
-
-    В PyInstaller one-file это временный каталог _MEIPASS. Его нельзя
-    использовать как рабочую область пользователя.
-    """
+    """Где лежат devctl.py и bundled-ресурсы."""
     if getattr(sys, "frozen", False):
         return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)).resolve()
     return Path(__file__).resolve().parents[1]
@@ -169,12 +170,6 @@ def app_dir() -> Path:
 
 
 def default_workspace_path() -> Path:
-    """Безопасная стартовая рабочая область для GUI.
-
-    Раньше frozen-сборка стартовала из _MEIPASS, поэтому пользователь видел
-    C:/Users/.../Temp/_MEI... и devctl закономерно падал. Если exe лежит в
-    project/release, по умолчанию берём project. Иначе берём папку рядом с exe.
-    """
     base = app_dir()
     if base.name.lower() == "release":
         return base.parent
@@ -182,7 +177,6 @@ def default_workspace_path() -> Path:
 
 
 def repo_root() -> Path:
-    # Обратная совместимость для старых мест вызова: это именно root ресурсов.
     return bundled_root()
 
 
@@ -191,9 +185,6 @@ def run_devctl_child(argv: list[str]) -> int:
         print("[ОШИБКА] child-режим ожидает: --devctl-child <workspace> <devctl args...>", file=sys.stderr)
         return 2
     workspace = Path(argv[0]).expanduser().resolve()
-    # Ядро devctl 0.5+ умеет явный workspace override через DEVCTL_WORKSPACE.
-    # Оставляем chdir для обратной совместимости, но дополнительно фиксируем
-    # workspace в окружении, чтобы status/plan/start не зависели от cwd child-процесса.
     os.environ["DEVCTL_WORKSPACE"] = str(workspace)
     devctl_args = argv[1:]
     if devctl_args and devctl_args[0] == "init":
@@ -227,9 +218,6 @@ def initial_workspace(config_data: dict) -> str:
     if configured:
         try:
             candidate = Path(str(configured)).expanduser().resolve()
-            # Старые сборки могли сохранить C:/Users/.../Temp/_MEI... в config.json.
-            # Такой путь является временной распаковкой exe и не должен становиться
-            # рабочей областью.
             if candidate.exists() and not looks_like_pyinstaller_temp(candidate):
                 return str(candidate)
         except Exception:
@@ -253,7 +241,7 @@ def save_config(data: dict) -> None:
 
 def open_path(path: str | Path | None) -> None:
     if not path:
-        messagebox.showinfo(APP_NAME, "Путь пока неизвестен.")
+        _show_info("Путь пока неизвестен.")
         return
     target = Path(path)
     try:
@@ -264,159 +252,128 @@ def open_path(path: str | Path | None) -> None:
         else:
             subprocess.Popen(["xdg-open", str(target)])
     except Exception as exc:
-        messagebox.showerror(APP_NAME, f"Не удалось открыть путь:\n{target}\n\n{exc}")
+        _show_error(f"Не удалось открыть путь:\n{target}\n\n{exc}")
 
 
-class StatusCard(ttk.Frame):
-    def __init__(self, master: tk.Misc, title: str):
-        super().__init__(master, padding=10, style="Card.TFrame")
-        self.title_label = ttk.Label(self, text=title, style="CardTitle.TLabel")
-        self.title_label.pack(anchor="w")
-        self.value_label = ttk.Label(self, text="—", style="CardMuted.TLabel", wraplength=230)
-        self.value_label.pack(anchor="w", pady=(6, 0))
+def _show_info(text: str, title: str = APP_NAME) -> None:
+    if QtWidgets is not None:
+        QtWidgets.QMessageBox.information(None, title, text)
+    else:
+        print(text)
+
+
+def _show_error(text: str, title: str = APP_NAME) -> None:
+    if QtWidgets is not None:
+        QtWidgets.QMessageBox.critical(None, title, text)
+    else:
+        print(text, file=sys.stderr)
+
+
+def _confirm(text: str, title: str = APP_NAME) -> bool:
+    if QtWidgets is None:
+        return False
+    answer = QtWidgets.QMessageBox.question(
+        None,
+        title,
+        text,
+        QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+        QtWidgets.QMessageBox.StandardButton.No,
+    )
+    return answer == QtWidgets.QMessageBox.StandardButton.Yes
+
+
+class StatusCard(QtWidgets.QFrame if QtWidgets else object):
+    def __init__(self, title: str) -> None:
+        if QtWidgets is None:
+            raise RuntimeError("PySide6 не импортирован")
+        super().__init__()
+        self.setObjectName("StatusCard")
+        self.setProperty("cardKind", "neutral")
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(6)
+        self.title_label = QtWidgets.QLabel(title)
+        self.title_label.setObjectName("CardTitle")
+        self.value_label = QtWidgets.QLabel("—")
+        self.value_label.setObjectName("CardValue")
+        self.value_label.setWordWrap(True)
+        layout.addWidget(self.title_label)
+        layout.addWidget(self.value_label, 1)
 
     def set(self, text: str, kind: str = "neutral") -> None:
-        style = {
-            "ok": "CardOk.TLabel",
-            "warn": "CardWarn.TLabel",
-            "bad": "CardBad.TLabel",
-            "neutral": "CardMuted.TLabel",
-        }.get(kind, "CardMuted.TLabel")
-        self.value_label.configure(text=text, style=style)
+        self.setProperty("cardKind", kind)
+        self.value_label.setProperty("kind", kind)
+        self.value_label.setText(text)
+        for widget in (self, self.value_label):
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
 
 
-class ToolTip:
-    """Лёгкая tooltip-подсказка для компактных icon-кнопок.
+class InitWorkspaceDialog(QtWidgets.QDialog if QtWidgets else object):
+    """Modal-dialog для создания нового devctl workspace."""
 
-    В нижней панели теперь показываются только монохромные символы, поэтому
-    полный текст действия должен быть доступен без догадок. Делаем это без
-    внешних зависимостей и без сложной графики, чтобы GUI оставался простым
-    Tkinter-приложением.
-    """
-
-    def __init__(self, widget: tk.Widget, text: str, *, delay_ms: int = 450) -> None:
-        self.widget = widget
-        self.text = text
-        self.delay_ms = delay_ms
-        self._after_id: str | None = None
-        self._window: tk.Toplevel | None = None
-        widget.bind("<Enter>", self._schedule, add="+")
-        widget.bind("<Leave>", self._hide, add="+")
-        widget.bind("<ButtonPress>", self._hide, add="+")
-
-    def _schedule(self, _event: tk.Event | None = None) -> None:
-        self._cancel()
-        self._after_id = self.widget.after(self.delay_ms, self._show)
-
-    def _cancel(self) -> None:
-        if self._after_id is not None:
-            try:
-                self.widget.after_cancel(self._after_id)
-            except tk.TclError:
-                pass
-            self._after_id = None
-
-    def _show(self) -> None:
-        if self._window is not None or not self.text:
-            return
-        try:
-            x = self.widget.winfo_rootx() + 8
-            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
-        except tk.TclError:
-            return
-        window = tk.Toplevel(self.widget)
-        window.wm_overrideredirect(True)
-        window.wm_geometry(f"+{x}+{y}")
-        label = tk.Label(
-            window,
-            text=self.text,
-            justify="left",
-            background="#161b22",
-            foreground="#f0f6fc",
-            activebackground="#161b22",
-            activeforeground="#f0f6fc",
-            relief="solid",
-            borderwidth=1,
-            padx=8,
-            pady=5,
-            font=("Segoe UI", 9),
-        )
-        label.pack()
-        self._window = window
-
-    def _hide(self, _event: tk.Event | None = None) -> None:
-        self._cancel()
-        if self._window is not None:
-            try:
-                self._window.destroy()
-            except tk.TclError:
-                pass
-            self._window = None
-
-
-class InitWorkspaceDialog(tk.Toplevel):
-    """Небольшой modal-dialog для создания нового devctl workspace."""
-
-    def __init__(self, master: tk.Misc, *, initial_parent: Path, initial_name: str = "devctl-workspace") -> None:
-        super().__init__(master)
-        self.title("Инициализация workspace")
-        self.resizable(False, False)
+    def __init__(self, parent, *, initial_parent: Path, initial_name: str = "devctl-workspace") -> None:
+        if QtWidgets is None:
+            raise RuntimeError("PySide6 не импортирован")
+        super().__init__(parent)
+        self.setWindowTitle("Инициализация workspace")
+        self.setModal(True)
+        self.setMinimumWidth(620)
         self.result: dict[str, str] | None = None
 
-        self.parent_var = tk.StringVar(value=str(initial_parent))
-        self.name_var = tk.StringVar(value=initial_name)
-        self.remote_var = tk.StringVar(value="")
-        self.branch_var = tk.StringVar(value="main")
+        body = QtWidgets.QVBoxLayout(self)
+        body.setContentsMargins(20, 20, 20, 20)
+        body.setSpacing(12)
 
-        body = ttk.Frame(self, padding=16)
-        body.pack(fill="both", expand=True)
+        title = QtWidgets.QLabel("Новый workspace")
+        title.setObjectName("DialogTitle")
+        body.addWidget(title)
+        intro = QtWidgets.QLabel(
+            "GUI создаст папку workspace и структуру devctl. Если указан GitHub/Git URL, "
+            "project/ будет клонирован или синхронизирован через fetch/pull."
+        )
+        intro.setWordWrap(True)
+        body.addWidget(intro)
 
-        ttk.Label(body, text="Новый workspace", font=("Segoe UI", 13, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
-        ttk.Label(
-            body,
-            text="GUI создаст папку workspace и структуру devctl. Если указан GitHub/Git URL, project/ будет клонирован или синхронизирован через fetch/pull.",
-            wraplength=560,
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 14))
+        form = QtWidgets.QFormLayout()
+        form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+        self.parent_edit = QtWidgets.QLineEdit(str(initial_parent))
+        choose_btn = QtWidgets.QPushButton("Выбрать...")
+        choose_btn.clicked.connect(self.choose_parent)
+        parent_row = QtWidgets.QHBoxLayout()
+        parent_row.addWidget(self.parent_edit, 1)
+        parent_row.addWidget(choose_btn)
+        form.addRow("Куда поместить workspace:", parent_row)
+        self.name_edit = QtWidgets.QLineEdit(initial_name)
+        form.addRow("Название workspace:", self.name_edit)
+        self.remote_edit = QtWidgets.QLineEdit("")
+        form.addRow("GitHub/Git remote URL, необязательно:", self.remote_edit)
+        self.branch_edit = QtWidgets.QLineEdit("main")
+        self.branch_edit.setMaximumWidth(180)
+        form.addRow("Основная ветка:", self.branch_edit)
+        body.addLayout(form)
 
-        ttk.Label(body, text="Куда поместить workspace:").grid(row=2, column=0, sticky="w")
-        parent_entry = ttk.Entry(body, textvariable=self.parent_var, width=62)
-        parent_entry.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 10))
-        ttk.Button(body, text="Выбрать...", command=self.choose_parent).grid(row=3, column=2, sticky="ew", padx=(8, 0), pady=(4, 10))
+        note = QtWidgets.QLabel(
+            "Если URL задан, GUI загрузит существующий remote-проект в project/ и явно выполнит "
+            "fetch/pull выбранной ветки."
+        )
+        note.setWordWrap(True)
+        note.setObjectName("MutedLabel")
+        body.addWidget(note)
 
-        ttk.Label(body, text="Название workspace:").grid(row=4, column=0, sticky="w")
-        ttk.Entry(body, textvariable=self.name_var, width=62).grid(row=5, column=0, columnspan=3, sticky="ew", pady=(4, 10))
-
-        ttk.Label(body, text="GitHub/Git remote URL для origin, необязательно:").grid(row=6, column=0, sticky="w")
-        ttk.Entry(body, textvariable=self.remote_var, width=62).grid(row=7, column=0, columnspan=3, sticky="ew", pady=(4, 10))
-
-        ttk.Label(
-            body,
-            text="Если URL задан, GUI загрузит существующий remote-проект в project/ и явно выполнит fetch/pull выбранной ветки.",
-            wraplength=560,
-        ).grid(row=8, column=0, columnspan=3, sticky="w", pady=(0, 10))
-
-        ttk.Label(body, text="Основная ветка:").grid(row=9, column=0, sticky="w")
-        ttk.Entry(body, textvariable=self.branch_var, width=20).grid(row=10, column=0, sticky="w", pady=(4, 16))
-
-        buttons = ttk.Frame(body)
-        buttons.grid(row=11, column=0, columnspan=3, sticky="e")
-        ttk.Button(buttons, text="Отмена", command=self.cancel).pack(side="right")
-        ttk.Button(buttons, text="Создать и открыть", command=self.accept).pack(side="right", padx=(0, 8))
-
-        body.columnconfigure(0, weight=1)
-        body.columnconfigure(1, weight=1)
-
-        self.transient(master)
-        self.grab_set()
-        self.protocol("WM_DELETE_WINDOW", self.cancel)
-        self.bind("<Return>", lambda _event: self.accept())
-        self.bind("<Escape>", lambda _event: self.cancel())
-        self.after(50, parent_entry.focus_set)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel | QtWidgets.QDialogButtonBox.StandardButton.Ok
+        )
+        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).setText("Создать и открыть")
+        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
+        buttons.accepted.connect(self.accept_request)
+        buttons.rejected.connect(self.reject)
+        body.addWidget(buttons)
 
     def choose_parent(self) -> None:
-        selected = filedialog.askdirectory(title="Выберите папку, внутри которой создать workspace", parent=self)
+        selected = QtWidgets.QFileDialog.getExistingDirectory(self, "Выберите папку, внутри которой создать workspace")
         if selected:
-            self.parent_var.set(selected)
+            self.parent_edit.setText(selected)
 
     @staticmethod
     def _validate_folder_name(name: str) -> str | None:
@@ -429,96 +386,92 @@ class InitWorkspaceDialog(tk.Toplevel):
             return "Название workspace не должно содержать символы: < > : \" / \\ | ? *"
         return None
 
-    def accept(self) -> None:
-        parent = self.parent_var.get().strip()
-        name = self.name_var.get().strip()
-        branch = self.branch_var.get().strip() or "main"
+    def accept_request(self) -> None:
+        parent = self.parent_edit.text().strip()
+        name = self.name_edit.text().strip()
+        branch = self.branch_edit.text().strip() or "main"
         error = self._validate_folder_name(name)
         if error:
-            messagebox.showerror(APP_NAME, error, parent=self)
+            QtWidgets.QMessageBox.critical(self, APP_NAME, error)
             return
         if not parent:
-            messagebox.showerror(APP_NAME, "Выберите родительскую директорию для workspace.", parent=self)
+            QtWidgets.QMessageBox.critical(self, APP_NAME, "Выберите родительскую директорию для workspace.")
             return
         self.result = {
             "parent": parent,
             "name": name,
-            "remoteUrl": self.remote_var.get().strip(),
+            "remoteUrl": self.remote_edit.text().strip(),
             "branch": branch,
         }
-        self.destroy()
-
-    def cancel(self) -> None:
-        self.result = None
-        self.destroy()
+        self.accept()
 
 
-class WorkspaceChoiceDialog(tk.Toplevel):
+class WorkspaceChoiceDialog(QtWidgets.QDialog if QtWidgets else object):
     """Modal-dialog для ручного выбора workspace при неоднозначном Patch Intake."""
 
-    def __init__(self, master: tk.Misc, *, workspaces: list[dict]) -> None:
-        super().__init__(master)
-        self.title("Выбор workspace для патча")
-        self.resizable(True, False)
+    def __init__(self, parent, *, workspaces: list[dict]) -> None:
+        if QtWidgets is None:
+            raise RuntimeError("PySide6 не импортирован")
+        super().__init__(parent)
+        self.setWindowTitle("Выбор workspace для патча")
+        self.setModal(True)
+        self.resize(680, 360)
         self.result: str | None = None
         self.workspaces = workspaces
+        self.buttons: list[QtWidgets.QRadioButton] = []
 
-        body = ttk.Frame(self, padding=16)
-        body.pack(fill="both", expand=True)
-        ttk.Label(body, text="Patch target is unclear", font=("Segoe UI", 13, "bold")).pack(anchor="w", pady=(0, 8))
-        ttk.Label(
-            body,
-            text="devctl не смог уверенно выбрать workspace. Укажите, куда импортировать последний patch.zip из Patch Inbox.",
-            wraplength=620,
-        ).pack(anchor="w", pady=(0, 10))
+        body = QtWidgets.QVBoxLayout(self)
+        body.setContentsMargins(20, 20, 20, 20)
+        body.setSpacing(12)
+        title = QtWidgets.QLabel("Patch target is unclear")
+        title.setObjectName("DialogTitle")
+        body.addWidget(title)
+        note = QtWidgets.QLabel(
+            "devctl не смог уверенно выбрать workspace. Укажите, куда импортировать последний patch.zip из Patch Inbox."
+        )
+        note.setWordWrap(True)
+        body.addWidget(note)
 
-        self.listbox = tk.Listbox(body, height=min(max(len(workspaces), 3), 10), width=88)
-        self.listbox.pack(fill="x", expand=True, pady=(0, 12))
-        for record in workspaces:
-            workspace_id = record.get("id") or "unknown"
-            name = record.get("name") or ""
-            path = record.get("path") or ""
-            self.listbox.insert("end", f"{workspace_id}    {name}    {path}")
-        if workspaces:
-            self.listbox.selection_set(0)
-            self.listbox.activate(0)
+        group = QtWidgets.QGroupBox("Workspace")
+        group_layout = QtWidgets.QVBoxLayout(group)
+        for index, record in enumerate(workspaces):
+            label = f"{record.get('id') or '(без id)'} · {record.get('name') or ''}\n{record.get('path') or ''}"
+            radio = QtWidgets.QRadioButton(label)
+            radio.setProperty("workspaceId", str(record.get("id") or ""))
+            if index == 0:
+                radio.setChecked(True)
+            self.buttons.append(radio)
+            group_layout.addWidget(radio)
+        body.addWidget(group, 1)
 
-        buttons = ttk.Frame(body)
-        buttons.pack(fill="x")
-        ttk.Button(buttons, text="Отмена", command=self.cancel).pack(side="right")
-        ttk.Button(buttons, text="Импортировать сюда", command=self.accept).pack(side="right", padx=(0, 8))
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel | QtWidgets.QDialogButtonBox.StandardButton.Ok
+        )
+        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).setText("Импортировать сюда")
+        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
+        buttons.accepted.connect(self.accept_request)
+        buttons.rejected.connect(self.reject)
+        body.addWidget(buttons)
 
-        self.transient(master)
-        self.grab_set()
-        self.protocol("WM_DELETE_WINDOW", self.cancel)
-        self.bind("<Return>", lambda _event: self.accept())
-        self.bind("<Escape>", lambda _event: self.cancel())
-        self.after(50, self.listbox.focus_set)
-
-    def accept(self) -> None:
-        selection = self.listbox.curselection()
-        if not selection:
-            messagebox.showerror(APP_NAME, "Выберите workspace.", parent=self)
+    def accept_request(self) -> None:
+        for button in self.buttons:
+            if button.isChecked():
+                self.result = str(button.property("workspaceId") or "")
+                break
+        if not self.result:
+            QtWidgets.QMessageBox.critical(self, APP_NAME, "Выберите workspace.")
             return
-        record = self.workspaces[int(selection[0])]
-        workspace_id = record.get("id")
-        if not workspace_id:
-            messagebox.showerror(APP_NAME, "У выбранного workspace нет id.", parent=self)
-            return
-        self.result = str(workspace_id)
-        self.destroy()
-
-    def cancel(self) -> None:
-        self.result = None
-        self.destroy()
+        self.accept()
 
 
-class DevctlGui(tk.Tk):
+class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
     def __init__(self) -> None:
+        if QtWidgets is None or QtCore is None or QtGui is None:
+            raise RuntimeError("PySide6 не импортирован")
         super().__init__()
-        self.title(f"{APP_NAME} v{APP_VERSION}")
-        self.geometry("1120x760")
-        self.minsize(980, 640)
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
+        self.resize(1120, 760)
+        self.setMinimumSize(980, 640)
 
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.current_process = None
@@ -528,36 +481,33 @@ class DevctlGui(tk.Tk):
         self.last_archive_path: str | None = None
         self.last_uts_path: str | None = None
         self.recommended_action_code = "refresh_status"
+        self._text_tabs: list[tuple[str, QtWidgets.QPlainTextEdit]] = []
 
         self.config_data = load_config()
         default_workspace = initial_workspace(self.config_data)
-        self.workspace_var = tk.StringVar(value=default_workspace)
         self.runner = DevctlRunner(default_workspace)
 
         self._setup_styles()
-        self._build_ui()
-        self.after(100, self.refresh_status)
-        self.after(100, self._drain_events)
+        self._build_ui(default_workspace)
+        self._timer = QtCore.QTimer(self)
+        self._timer.timeout.connect(self._drain_events)
+        self._timer.start(100)
+        QtCore.QTimer.singleShot(100, self.refresh_status)
 
-    def report_callback_exception(self, exc, val, tb) -> None:
-        """Показываем ошибки GUI-callback прямо пользователю.
+    def _guard(self, func: Callable, *args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception:
+            self._show_callback_exception(*sys.exc_info())
+            return None
 
-        В собранном .exe исключения Tkinter иначе легко выглядят как
-        «кнопка не нажимается»: traceback уходит в невидимую консоль.
-        """
-        details = "".join(traceback.format_exception(exc, val, tb))
+    def _show_callback_exception(self, exc_type, exc, tb) -> None:
+        details = "".join(traceback.format_exception(exc_type, exc, tb))
         self.set_text(self.report_text, "== ошибка GUI ==\n\n" + details)
-        self.notebook.select(2)
-        messagebox.showerror(APP_NAME, f"Ошибка в обработчике GUI:\n{val}", parent=self)
+        self.notebook.setCurrentIndex(2)
+        QtWidgets.QMessageBox.critical(self, APP_NAME, f"Ошибка в обработчике GUI:\n{exc}")
 
     def _setup_styles(self) -> None:
-        self.configure(background="#0d1117")
-        style = ttk.Style(self)
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-
         self.colors = {
             "bg": "#0d1117",
             "panel": "#161b22",
@@ -572,187 +522,278 @@ class DevctlGui(tk.Tk):
             "button_active": "#30363d",
             "entry": "#0d1117",
             "select": "#264f78",
+            "accent": "#238636",
+            "accent_hover": "#2ea043",
         }
         c = self.colors
+        self.setStyleSheet(f"""
+            QMainWindow, QWidget {{
+                background: {c['bg']};
+                color: {c['text']};
+                font-family: 'Segoe UI', 'Inter', Arial, sans-serif;
+                font-size: 10pt;
+            }}
+            QLabel#HeaderLabel {{
+                color: #f0f6fc;
+                font-size: 15pt;
+                font-weight: 700;
+            }}
+            QLabel#SubtleLabel, QLabel#MutedLabel {{
+                color: {c['muted']};
+                font-size: 9pt;
+            }}
+            QLabel#DialogTitle {{
+                color: #f0f6fc;
+                font-size: 14pt;
+                font-weight: 700;
+            }}
+            QFrame#StatusCard, QFrame#NextActionCard {{
+                background: {c['panel']};
+                border: 1px solid {c['border']};
+                border-radius: 14px;
+            }}
+            QLabel#CardTitle {{
+                color: #f0f6fc;
+                font-weight: 700;
+            }}
+            QLabel#CardValue {{ color: {c['muted']}; }}
+            QLabel#CardValue[kind="ok"] {{ color: {c['ok']}; font-weight: 700; }}
+            QLabel#CardValue[kind="warn"] {{ color: {c['warn']}; font-weight: 700; }}
+            QLabel#CardValue[kind="bad"] {{ color: {c['bad']}; font-weight: 700; }}
+            QLabel#NextActionTitle {{
+                color: #f0f6fc;
+                font-size: 12pt;
+                font-weight: 700;
+            }}
+            QLabel#NextActionTitle[kind="ok"] {{ color: {c['ok']}; }}
+            QLabel#NextActionTitle[kind="warn"] {{ color: {c['warn']}; }}
+            QLabel#NextActionTitle[kind="bad"] {{ color: {c['bad']}; }}
+            QLabel#NextActionBody {{ color: {c['text']}; }}
+            QLineEdit {{
+                background: {c['entry']};
+                color: {c['text']};
+                border: 1px solid {c['border']};
+                border-radius: 10px;
+                padding: 8px 10px;
+                selection-background-color: {c['select']};
+            }}
+            QPushButton {{
+                background: {c['button']};
+                color: {c['text']};
+                border: 1px solid {c['border']};
+                border-radius: 10px;
+                padding: 8px 12px;
+                min-height: 22px;
+            }}
+            QPushButton:hover {{ background: {c['button_active']}; }}
+            QPushButton:pressed {{ background: #1f6feb; }}
+            QPushButton:disabled {{ color: #6e7681; background: {c['button']}; }}
+            QPushButton#MagicButton {{
+                background: {c['accent']};
+                color: white;
+                border: 1px solid {c['accent_hover']};
+                border-radius: 14px;
+                padding: 13px 18px;
+                font-size: 13pt;
+                font-weight: 700;
+            }}
+            QPushButton#MagicButton:hover {{ background: {c['accent_hover']}; }}
+            QPushButton#IconButton {{
+                font-family: 'Segoe UI Symbol', 'Segoe UI', sans-serif;
+                font-size: 13pt;
+                font-weight: 700;
+                min-width: 32px;
+                padding: 6px 8px;
+                border-radius: 10px;
+            }}
+            QTabWidget::pane {{
+                border: 1px solid {c['border']};
+                border-radius: 12px;
+                top: -1px;
+                background: {c['panel2']};
+            }}
+            QTabBar::tab {{
+                background: {c['button']};
+                color: {c['muted']};
+                border: 1px solid {c['border']};
+                border-bottom: none;
+                border-top-left-radius: 10px;
+                border-top-right-radius: 10px;
+                padding: 8px 14px;
+                margin-right: 4px;
+            }}
+            QTabBar::tab:selected {{ color: #f0f6fc; background: {c['panel']}; }}
+            QPlainTextEdit {{
+                background: {c['panel2']};
+                color: {c['text']};
+                border: none;
+                selection-background-color: {c['select']};
+                font-family: Consolas, 'Cascadia Mono', monospace;
+                font-size: 10pt;
+                padding: 10px;
+            }}
+            QScrollBar:vertical {{
+                background: {c['panel2']};
+                width: 12px;
+                margin: 2px;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {c['border']};
+                border-radius: 6px;
+                min-height: 24px;
+            }}
+            QGroupBox {{
+                border: 1px solid {c['border']};
+                border-radius: 12px;
+                margin-top: 10px;
+                padding: 14px 10px 10px 10px;
+                background: {c['panel']};
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 6px;
+                color: #f0f6fc;
+            }}
+        """)
 
-        style.configure(".", background=c["bg"], foreground=c["text"], fieldbackground=c["entry"], bordercolor=c["border"], lightcolor=c["border"], darkcolor=c["border"])
-        style.configure("Main.TFrame", background=c["bg"])
-        style.configure("Card.TFrame", background=c["panel"], relief="solid", borderwidth=1, bordercolor=c["border"])
-        style.configure("TFrame", background=c["bg"])
-        style.configure("TLabel", font=("Segoe UI", 10), background=c["bg"], foreground=c["text"])
-        style.configure("Header.TLabel", font=("Segoe UI", 15, "bold"), background=c["bg"], foreground="#f0f6fc")
-        style.configure("Subtle.TLabel", font=("Segoe UI", 9), foreground=c["muted"], background=c["bg"])
-        style.configure("CardTitle.TLabel", background=c["panel"], foreground="#f0f6fc", font=("Segoe UI", 10, "bold"))
-        style.configure("CardMuted.TLabel", background=c["panel"], foreground=c["muted"], font=("Segoe UI", 10))
-        style.configure("CardOk.TLabel", background=c["panel"], foreground=c["ok"], font=("Segoe UI", 10, "bold"))
-        style.configure("CardWarn.TLabel", background=c["panel"], foreground=c["warn"], font=("Segoe UI", 10, "bold"))
-        style.configure("CardBad.TLabel", background=c["panel"], foreground=c["bad"], font=("Segoe UI", 10, "bold"))
-        style.configure("NextActionTitle.TLabel", background=c["panel"], foreground="#f0f6fc", font=("Segoe UI", 12, "bold"))
-        style.configure("NextActionBody.TLabel", background=c["panel"], foreground=c["text"], font=("Segoe UI", 10))
-        style.configure("NextActionOk.TLabel", background=c["panel"], foreground=c["ok"], font=("Segoe UI", 12, "bold"))
-        style.configure("NextActionWarn.TLabel", background=c["panel"], foreground=c["warn"], font=("Segoe UI", 12, "bold"))
-        style.configure("NextActionBad.TLabel", background=c["panel"], foreground=c["bad"], font=("Segoe UI", 12, "bold"))
-        style.configure("Magic.TButton", font=("Segoe UI", 13, "bold"), padding=(18, 12), background="#238636", foreground="#ffffff", bordercolor="#2ea043")
-        style.map("Magic.TButton", background=[("active", "#2ea043"), ("disabled", c["button"])], foreground=[("disabled", c["muted"])])
-        style.configure("Action.TButton", font=("Segoe UI", 10), padding=(10, 7), background=c["button"], foreground=c["text"], bordercolor=c["border"])
-        style.map("Action.TButton", background=[("active", c["button_active"]), ("disabled", c["button"])], foreground=[("disabled", "#6e7681")])
-        style.configure("Icon.TButton", font=("Segoe UI Symbol", 12, "bold"), padding=(6, 5), background=c["button"], foreground=c["text"], bordercolor=c["border"])
-        style.map("Icon.TButton", background=[("active", c["button_active"]), ("disabled", c["button"])], foreground=[("disabled", "#6e7681")])
-        style.configure("TEntry", fieldbackground=c["entry"], foreground=c["text"], insertcolor=c["text"], bordercolor=c["border"], lightcolor=c["border"], darkcolor=c["border"])
-        style.configure("TNotebook", background=c["bg"], borderwidth=0)
-        style.configure("TNotebook.Tab", background=c["button"], foreground=c["muted"], padding=(12, 7))
-        style.map("TNotebook.Tab", background=[("selected", c["panel"])], foreground=[("selected", "#f0f6fc")])
-        style.configure("Vertical.TScrollbar", background=c["button"], troughcolor=c["panel2"], bordercolor=c["border"], arrowcolor=c["muted"])
-
-
-    def _make_icon_button(self, master: tk.Misc, icon: str, tooltip: str, command) -> ttk.Button:
-        """Создать компактную нижнюю кнопку: символ вместо длинного текста."""
-        button = ttk.Button(master, text=icon, width=3, command=command, style="Icon.TButton")
-        ToolTip(button, tooltip)
+    def _make_icon_button(self, icon: str, tooltip: str, command: Callable) -> QtWidgets.QPushButton:
+        button = QtWidgets.QPushButton(icon)
+        button.setObjectName("IconButton")
+        button.setToolTip(tooltip)
+        button.clicked.connect(lambda _checked=False, cmd=command: self._guard(cmd))
         return button
 
-    def _build_ui(self) -> None:
-        root = ttk.Frame(self, padding=14, style="Main.TFrame")
-        root.pack(fill="both", expand=True)
+    def _build_ui(self, default_workspace: str) -> None:
+        root = QtWidgets.QWidget()
+        self.setCentralWidget(root)
+        main = QtWidgets.QVBoxLayout(root)
+        main.setContentsMargins(16, 16, 16, 16)
+        main.setSpacing(12)
 
-        top = ttk.Frame(root, style="Main.TFrame")
-        top.pack(fill="x")
-        ttk.Label(top, text="Рабочая область", style="Header.TLabel").pack(side="left")
-        ttk.Label(top, text=f"devctl v{BUNDLED_DEVCTL_VERSION} · GUI v{APP_VERSION}", style="Subtle.TLabel").pack(side="right")
+        top = QtWidgets.QHBoxLayout()
+        header = QtWidgets.QLabel("Рабочая область")
+        header.setObjectName("HeaderLabel")
+        version = QtWidgets.QLabel(f"devctl v{BUNDLED_DEVCTL_VERSION} · GUI v{APP_VERSION} · Qt/PySide6")
+        version.setObjectName("SubtleLabel")
+        top.addWidget(header)
+        top.addStretch(1)
+        top.addWidget(version)
+        main.addLayout(top)
 
-        path_row = ttk.Frame(root, style="Main.TFrame")
-        path_row.pack(fill="x", pady=(8, 12))
-        self.path_entry = ttk.Entry(path_row, textvariable=self.workspace_var)
-        self.path_entry.pack(side="left", fill="x", expand=True)
-        ttk.Button(path_row, text="Выбрать", command=self.choose_workspace, style="Action.TButton").pack(side="left", padx=(8, 0))
-        self.init_top_btn = ttk.Button(path_row, text="Новый workspace", command=self.init_workspace, style="Action.TButton")
-        self.init_top_btn.pack(side="left", padx=(8, 0))
-        ttk.Button(path_row, text="Обновить", command=self.refresh_status, style="Action.TButton").pack(side="left", padx=(8, 0))
+        path_row = QtWidgets.QHBoxLayout()
+        self.path_entry = QtWidgets.QLineEdit(default_workspace)
+        path_row.addWidget(self.path_entry, 1)
+        choose_btn = QtWidgets.QPushButton("Выбрать")
+        choose_btn.clicked.connect(lambda: self._guard(self.choose_workspace))
+        self.init_top_btn = QtWidgets.QPushButton("Новый workspace")
+        self.init_top_btn.clicked.connect(lambda: self._guard(self.init_workspace))
+        refresh_btn = QtWidgets.QPushButton("Обновить")
+        refresh_btn.clicked.connect(lambda: self._guard(self.refresh_status))
+        path_row.addWidget(choose_btn)
+        path_row.addWidget(self.init_top_btn)
+        path_row.addWidget(refresh_btn)
+        main.addLayout(path_row)
 
-        cards = ttk.Frame(root, style="Main.TFrame")
-        cards.pack(fill="x", pady=(0, 12))
+        cards_layout = QtWidgets.QGridLayout()
+        cards_layout.setSpacing(8)
         self.cards = {
-            "project": StatusCard(cards, "Проект"),
-            "git": StatusCard(cards, "Git"),
-            "patch": StatusCard(cards, "Патч"),
-            "uts": StatusCard(cards, "UTS"),
-            "push": StatusCard(cards, "Push"),
+            "project": StatusCard("Проект"),
+            "git": StatusCard("Git"),
+            "patch": StatusCard("Патч"),
+            "uts": StatusCard("UTS"),
+            "push": StatusCard("Push"),
         }
         for index, card in enumerate(self.cards.values()):
-            card.grid(row=0, column=index, sticky="nsew", padx=(0 if index == 0 else 8, 0))
-            cards.columnconfigure(index, weight=1)
+            cards_layout.addWidget(card, 0, index)
+            cards_layout.setColumnStretch(index, 1)
+        main.addLayout(cards_layout)
 
-        self.next_action_frame = ttk.Frame(root, padding=12, style="Card.TFrame")
-        self.next_action_frame.pack(fill="x", pady=(0, 12))
-        ttk.Label(self.next_action_frame, text="Следующее действие", style="CardTitle.TLabel").pack(anchor="w")
-        self.next_action_title = ttk.Label(self.next_action_frame, text="Проверить workspace", style="NextActionTitle.TLabel", wraplength=980)
-        self.next_action_title.pack(anchor="w", pady=(6, 0))
-        self.next_action_body = ttk.Label(
-            self.next_action_frame,
-            text="GUI сейчас обновит статус и подскажет безопасный следующий шаг.",
-            style="NextActionBody.TLabel",
-            wraplength=980,
-        )
-        self.next_action_body.pack(anchor="w", pady=(4, 0))
+        self.next_action_frame = QtWidgets.QFrame()
+        self.next_action_frame.setObjectName("NextActionCard")
+        next_layout = QtWidgets.QVBoxLayout(self.next_action_frame)
+        next_layout.setContentsMargins(14, 12, 14, 12)
+        next_layout.setSpacing(6)
+        next_label = QtWidgets.QLabel("Следующее действие")
+        next_label.setObjectName("CardTitle")
+        self.next_action_title = QtWidgets.QLabel("Проверить workspace")
+        self.next_action_title.setObjectName("NextActionTitle")
+        self.next_action_title.setWordWrap(True)
+        self.next_action_body = QtWidgets.QLabel("GUI сейчас обновит статус и подскажет безопасный следующий шаг.")
+        self.next_action_body.setObjectName("NextActionBody")
+        self.next_action_body.setWordWrap(True)
+        next_layout.addWidget(next_label)
+        next_layout.addWidget(self.next_action_title)
+        next_layout.addWidget(self.next_action_body)
+        main.addWidget(self.next_action_frame)
 
-        self.main_button = ttk.Button(root, text="Проверить workspace", command=self.perform_recommended_action, style="Magic.TButton")
-        self.main_button.pack(fill="x", pady=(0, 10))
+        self.main_button = QtWidgets.QPushButton("Проверить workspace")
+        self.main_button.setObjectName("MagicButton")
+        self.main_button.clicked.connect(lambda: self._guard(self.perform_recommended_action))
+        main.addWidget(self.main_button)
 
-        # Панель действий должна быть видна сразу после запуска окна. Раньше она
-        # находилась под растягиваемым notebook-логом и могла уезжать ниже
-        # нижнего края окна, пока пользователь вручную не увеличит высоту.
-        actions = ttk.Frame(root, style="Main.TFrame")
-        actions.pack(fill="x", pady=(0, 8))
-        self.init_btn = self._make_icon_button(actions, "＋", "Инициализировать workspace", self.init_workspace)
-        self.status_btn = self._make_icon_button(actions, "●", "Показать статус", self.refresh_status)
-        self.sync_btn = self._make_icon_button(actions, "⇄", "Синхронизировать workspace с GitHub: project -> archives -> UTS", self.sync_workspace)
-        self.inbox_btn = self._make_icon_button(actions, "⇩", "Забрать patch.zip из Patch Inbox", self.grab_inbox_patch)
-        self.plan_btn = self._make_icon_button(actions, "☷", "Построить dry-run план", self.build_plan)
-        self.start_btn = self._make_icon_button(actions, "▶", "Запустить конвейер с push по плану", lambda: self.start_pipeline(False))
-        self.no_push_btn = self._make_icon_button(actions, "⊘", "Запустить конвейер без push", lambda: self.start_pipeline(True))
-        self.upgrade_btn = self._make_icon_button(actions, "⇧", "Безопасно обновить структуру workspace", self.upgrade_workspace)
-        self.reset_btn = self._make_icon_button(actions, "↺", "Reset project: git reset --hard + git clean", self.reset_project)
-        self.report_btn = self._make_icon_button(actions, "☰", "Открыть последний отчёт", self.open_report)
-        self.archives_btn = self._make_icon_button(actions, "▤", "Открыть archives/", self.open_archives)
-        self.uts_btn = self._make_icon_button(actions, "◇", "Открыть UserTestSpace/ или свежую UTS-копию", self.open_uts)
-        self.project_btn = self._make_icon_button(actions, "⌂", "Открыть project/", self.open_project)
-        self.copy_output_btn = self._make_icon_button(actions, "⧉", "Скопировать текущий вывод активной вкладки", self.copy_current_output)
-        self.copy_prompt_btn = self._make_icon_button(actions, "✎", "Скопировать prompt-патча", self.copy_patch_prompt)
+        actions = QtWidgets.QHBoxLayout()
+        actions.setSpacing(6)
+        self.init_btn = self._make_icon_button("＋", "Инициализировать workspace", self.init_workspace)
+        self.status_btn = self._make_icon_button("●", "Показать статус", self.refresh_status)
+        self.sync_btn = self._make_icon_button("⇄", "Синхронизировать workspace с GitHub: project -> archives -> UTS", self.sync_workspace)
+        self.inbox_btn = self._make_icon_button("⇩", "Забрать patch.zip из Patch Inbox", self.grab_inbox_patch)
+        self.plan_btn = self._make_icon_button("☷", "Построить dry-run план", self.build_plan)
+        self.start_btn = self._make_icon_button("▶", "Запустить конвейер с push по плану", lambda: self.start_pipeline(False))
+        self.no_push_btn = self._make_icon_button("⊘", "Запустить конвейер без push", lambda: self.start_pipeline(True))
+        self.upgrade_btn = self._make_icon_button("⇧", "Безопасно обновить структуру workspace", self.upgrade_workspace)
+        self.reset_btn = self._make_icon_button("↺", "Reset project: git reset --hard + git clean", self.reset_project)
+        self.report_btn = self._make_icon_button("☰", "Открыть последний отчёт", self.open_report)
+        self.archives_btn = self._make_icon_button("▤", "Открыть archives/", self.open_archives)
+        self.uts_btn = self._make_icon_button("◇", "Открыть UserTestSpace/ или свежую UTS-копию", self.open_uts)
+        self.project_btn = self._make_icon_button("⌂", "Открыть project/", self.open_project)
+        self.copy_output_btn = self._make_icon_button("⧉", "Скопировать текущий вывод активной вкладки", self.copy_current_output)
+        self.copy_prompt_btn = self._make_icon_button("✎", "Скопировать prompt-патча", self.copy_patch_prompt)
         self.action_buttons = (
-            self.init_btn,
-            self.status_btn,
-            self.sync_btn,
-            self.inbox_btn,
-            self.plan_btn,
-            self.start_btn,
-            self.no_push_btn,
-            self.upgrade_btn,
-            self.reset_btn,
-            self.report_btn,
-            self.archives_btn,
-            self.uts_btn,
-            self.project_btn,
-            self.copy_output_btn,
-            self.copy_prompt_btn,
+            self.init_btn, self.status_btn, self.sync_btn, self.inbox_btn, self.plan_btn,
+            self.start_btn, self.no_push_btn, self.upgrade_btn, self.reset_btn, self.report_btn,
+            self.archives_btn, self.uts_btn, self.project_btn, self.copy_output_btn, self.copy_prompt_btn,
         )
-        for index, widget in enumerate(self.action_buttons):
-            widget.grid(row=0, column=index, sticky="w", padx=(0, 6))
-        actions.columnconfigure(len(self.action_buttons), weight=1)
+        for widget in self.action_buttons:
+            actions.addWidget(widget)
+        actions.addStretch(1)
+        main.addLayout(actions)
 
-        self.notebook = ttk.Notebook(root)
-        self.notebook.pack(fill="both", expand=True)
+        self.notebook = QtWidgets.QTabWidget()
         self.plan_text = self._make_text_tab("План")
         self.run_text = self._make_text_tab("Запуск")
         self.report_text = self._make_text_tab("Отчёт")
+        main.addWidget(self.notebook, 1)
 
-    def _make_text_tab(self, title: str) -> tk.Text:
-        frame = ttk.Frame(self.notebook, style="Main.TFrame")
-        self.notebook.add(frame, text=title)
-        colors = getattr(self, "colors", {})
-        text = tk.Text(
-            frame,
-            wrap="word",
-            font=("Consolas", 10),
-            undo=False,
-            background=colors.get("panel2", "#010409"),
-            foreground=colors.get("text", "#c9d1d9"),
-            insertbackground=colors.get("text", "#c9d1d9"),
-            selectbackground=colors.get("select", "#264f78"),
-            relief="flat",
-            borderwidth=1,
-            highlightthickness=1,
-            highlightbackground=colors.get("border", "#30363d"),
-            highlightcolor=colors.get("border", "#30363d"),
-        )
-        scroll = ttk.Scrollbar(frame, orient="vertical", command=text.yview, style="Vertical.TScrollbar")
-        text.configure(yscrollcommand=scroll.set)
-        text.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
+    def _make_text_tab(self, title: str) -> QtWidgets.QPlainTextEdit:
+        text = QtWidgets.QPlainTextEdit()
+        text.setReadOnly(True)
+        text.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.notebook.addTab(text, title)
+        self._text_tabs.append((title, text))
         return text
 
-    def set_text(self, widget: tk.Text, value: str) -> None:
-        widget.configure(state="normal")
-        widget.delete("1.0", "end")
-        widget.insert("end", value)
-        widget.configure(state="disabled")
+    def set_text(self, widget: QtWidgets.QPlainTextEdit, value: str) -> None:
+        widget.setPlainText(value or "")
+        cursor = widget.textCursor()
+        cursor.movePosition(QtGui.QTextCursor.MoveOperation.Start)
+        widget.setTextCursor(cursor)
 
     def append_run(self, value: str) -> None:
-        self.run_text.configure(state="normal")
-        self.run_text.insert("end", value)
-        self.run_text.see("end")
-        self.run_text.configure(state="disabled")
+        cursor = self.run_text.textCursor()
+        cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+        cursor.insertText(value)
+        self.run_text.setTextCursor(cursor)
+        self.run_text.ensureCursorVisible()
 
     def _set_next_action(self, code: str, title: str, details: str, button_text: str, kind: str = "neutral") -> None:
         self.recommended_action_code = code
-        title_style = {
-            "ok": "NextActionOk.TLabel",
-            "warn": "NextActionWarn.TLabel",
-            "bad": "NextActionBad.TLabel",
-            "neutral": "NextActionTitle.TLabel",
-        }.get(kind, "NextActionTitle.TLabel")
-        self.next_action_title.configure(text=title, style=title_style)
-        self.next_action_body.configure(text=details)
-        self.main_button.configure(text=button_text)
+        self.next_action_title.setProperty("kind", kind)
+        self.next_action_title.setText(title)
+        self.next_action_body.setText(details)
+        self.main_button.setText(button_text)
+        self.next_action_title.style().unpolish(self.next_action_title)
+        self.next_action_title.style().polish(self.next_action_title)
 
     def perform_recommended_action(self) -> None:
         actions = {
@@ -772,8 +813,7 @@ class DevctlGui(tk.Tk):
             "open_uts": self.open_uts,
             "copy_patch_prompt": self.copy_patch_prompt,
         }
-        action = actions.get(self.recommended_action_code, self.refresh_status)
-        action()
+        actions.get(self.recommended_action_code, self.refresh_status)()
 
     @staticmethod
     def _workspace_upgrade_details(workspace_config: dict) -> str:
@@ -788,393 +828,185 @@ class DevctlGui(tk.Tk):
         git = data.get("git", {}) if isinstance(data.get("git"), dict) else {}
         patches = data.get("patches", {}) if isinstance(data.get("patches"), dict) else {}
         latest = patches.get("latest")
-
         project_root = workspace.get("projectRoot") or "project/"
-        patches_dir = workspace.get("patchesDir") or "patches/"
         workspace_config = data.get("workspaceConfig", {}) if isinstance(data.get("workspaceConfig"), dict) else {}
         upgrade_available = bool(workspace.get("projectExists") and workspace_config.get("upgradeAvailable"))
         upgrade_details = self._workspace_upgrade_details(workspace_config)
-
         if not workspace.get("projectExists"):
-            self._set_next_action(
-                "init_workspace",
-                "Создать или выбрать рабочую область devctl",
-                f"В текущем workspace не найден project/: {project_root}. Можно создать новый workspace мастером или выбрать уже существующий.",
-                "Инициализировать workspace",
-                "warn",
-            )
+            self._set_next_action("init_workspace", "Создать или выбрать рабочую область devctl", f"В текущем workspace не найден project/: {project_root}. Можно создать новый workspace мастером или выбрать уже существующий.", "Инициализировать workspace", "warn")
             return
-
         if not git.get("available"):
-            self._set_next_action(
-                "refresh_status",
-                "Установить или добавить Git в PATH",
-                "devctl не видит git.exe/git. Установите Git for Windows или добавьте его в PATH, затем обновите статус.",
-                "Обновить статус",
-                "bad",
-            )
+            self._set_next_action("refresh_status", "Установить или добавить Git в PATH", "devctl не видит git.exe/git. Установите Git for Windows или добавьте его в PATH, затем обновите статус.", "Обновить статус", "bad")
             return
-
         if not git.get("isRepository"):
-            self._set_next_action(
-                "open_project",
-                "Проверить Git-репозиторий в project/",
-                f"Папка project/ найдена, но не является Git-репозиторием: {project_root}. Откройте её и выполните git init или создайте workspace через мастер.",
-                "Открыть project/",
-                "bad",
-            )
+            self._set_next_action("open_project", "Проверить Git-репозиторий в project/", f"Папка project/ найдена, но не является Git-репозиторием: {project_root}. Откройте её и выполните git init или создайте workspace через мастер.", "Открыть project/", "bad")
             return
-
         if git.get("clean") is False:
-            self._set_next_action(
-                "reset_project",
-                "Рабочее дерево project/ загрязнено",
-                "Можно открыть git status для ручной проверки или нажать reset: GUI вызовет devctl reset после отдельного предупреждения и откатит project/ через git reset --hard + git clean -fd.",
-                "Reset project",
-                "warn",
-            )
+            self._set_next_action("reset_project", "Рабочее дерево project/ загрязнено", "Можно открыть git status для ручной проверки или нажать reset: GUI вызовет devctl reset после отдельного предупреждения и откатит project/ через git reset --hard + git clean -fd.", "Reset project", "warn")
             return
-
         if not latest:
             if self.last_report_path:
-                self._set_next_action(
-                    "open_report",
-                    "Посмотреть отчёт последнего запуска",
-                    "Неприменённых патчей сейчас нет. Можно открыть последний отчёт или добавить новый patch.zip в папку patches/.",
-                    "Открыть последний отчёт",
-                    "ok",
-                )
+                self._set_next_action("open_report", "Посмотреть отчёт последнего запуска", "Неприменённых патчей сейчас нет. Можно открыть последний отчёт или добавить новый patch.zip в папку patches/.", "Открыть последний отчёт", "ok")
             elif upgrade_available:
-                self._set_next_action(
-                    "upgrade_workspace",
-                    "Безопасно обновить структуру workspace",
-                    f"devctl видит, что workspace можно актуализировать: {upgrade_details}. Команда init --upgrade не трогает project/ и пользовательские пути, а только добавляет недостающую инфраструктуру.",
-                    "Обновить структуру workspace",
-                    "warn",
-                )
+                self._set_next_action("upgrade_workspace", "Безопасно обновить структуру workspace", f"devctl видит, что workspace можно актуализировать: {upgrade_details}. Команда init --upgrade не трогает project/ и пользовательские пути, а только добавляет недостающую инфраструктуру.", "Обновить структуру workspace", "warn")
             else:
-                self._set_next_action(
-                    "grab_inbox_patch",
-                    "Забрать новый patch.zip из Patch Inbox",
-                    "Неприменённых патчей в patches/ нет. Если patch.zip уже лежит в общем складе, GUI вызовет `devctl inbox grab --json`: ядро само определит workspace, скопирует архив в patches/ и не будет применять его автоматически.",
-                    "Забрать патч из склада",
-                    "ok",
-                )
+                self._set_next_action("grab_inbox_patch", "Забрать новый patch.zip из Patch Inbox", "Неприменённых патчей в patches/ нет. Если patch.zip уже лежит в общем складе, GUI вызовет `devctl inbox grab --json`: ядро само определит workspace, скопирует архив в patches/ и не будет применять его автоматически.", "Забрать патч из склада", "ok")
             return
-
         if latest.get("manifestError"):
-            self._set_next_action(
-                "build_plan",
-                "Посмотреть ошибку патча",
-                f"Найден patch.zip, но его манифест некорректен: {latest.get('manifestError')}. Постройте план, чтобы увидеть детали валидации.",
-                "Показать ошибку патча",
-                "bad",
-            )
+            self._set_next_action("build_plan", "Посмотреть ошибку патча", f"Найден patch.zip, но его манифест некорректен: {latest.get('manifestError')}. Постройте план, чтобы увидеть детали валидации.", "Показать ошибку патча", "bad")
             return
-
         title = latest.get("title") or latest.get("name") or "следующий патч"
         upgrade_note = ""
         if upgrade_available:
             upgrade_note = f" Дополнительно devctl предлагает обновить структуру workspace: {upgrade_details}. Это не блокирует построение плана и запуск патча."
-        self._set_next_action(
-            "build_plan",
-            "Построить прозрачный план запуска",
-            f"Workspace выглядит готовым. Следующий патч: {title}. Перед запуском лучше посмотреть dry-run план: файлы, проверки, commit и push.{upgrade_note}",
-            "Построить план",
-            "ok",
-        )
+        self._set_next_action("build_plan", "Построить прозрачный план запуска", f"Workspace выглядит готовым. Следующий патч: {title}. Перед запуском лучше посмотреть dry-run план: файлы, проверки, commit и push.{upgrade_note}", "Построить план", "ok")
 
     def _recommend_from_plan(self, data: dict, result: RunResult) -> None:
         if not isinstance(data, dict) or not data:
-            self._set_next_action(
-                "refresh_status",
-                "Не удалось разобрать план",
-                result.stderr or result.stdout or "Команда plan не вернула JSON. Обновите статус и проверьте вкладку «План».",
-                "Обновить статус",
-                "bad",
-            )
+            self._set_next_action("refresh_status", "Не удалось разобрать план", result.stderr or result.stdout or "Команда plan не вернула JSON. Обновите статус и проверьте вкладку «План».", "Обновить статус", "bad")
             return
-
         if not data.get("ok"):
             validation = data.get("validation") if isinstance(data.get("validation"), dict) else {}
             error = validation.get("error") or data.get("error") or "Патч не прошёл dry-run проверку."
-            self._set_next_action(
-                "open_patches",
-                "Исправить или заменить patch.zip",
-                f"План построить нельзя: {error} После исправления положите обновлённый архив в patches/ и нажмите «Обновить».",
-                "Открыть patches/",
-                "bad",
-            )
+            self._set_next_action("open_patches", "Исправить или заменить patch.zip", f"План построить нельзя: {error} После исправления положите обновлённый архив в patches/ и нажмите «Обновить».", "Открыть patches/", "bad")
             return
-
         patch = data.get("patch") if isinstance(data.get("patch"), dict) else {}
         manifest = data.get("manifest") if isinstance(data.get("manifest"), dict) else {}
         apply = data.get("apply") if isinstance(data.get("apply"), dict) else {}
         checks = data.get("checks") if isinstance(data.get("checks"), list) else []
         push = data.get("push") if isinstance(data.get("push"), dict) else {}
-
         patch_title = manifest.get("title") or patch.get("title") or patch.get("name") or "патч"
         push_text = "без push"
         if push.get("enabled"):
             push_text = f"push в {push.get('remote') or 'origin'}/{push.get('branch') or 'текущую ветку'}"
-        self._set_next_action(
-            "start_pipeline",
-            f"Запустить конвейер для патча «{patch_title}»",
-            "План готов: "
-            f"файлов к копированию — {apply.get('copyCount', 0)}, "
-            f"удалений — {apply.get('deleteCount', 0)}, "
-            f"проверок — {len(checks)}, {push_text}. После нажатия devctl применит патч, выполнит проверки, сделает commit и при необходимости push.",
-            "Запустить конвейер",
-            "ok",
-        )
+        self._set_next_action("start_pipeline", f"Запустить конвейер для патча «{patch_title}»", "План готов: " f"файлов к копированию — {apply.get('copyCount', 0)}, " f"удалений — {apply.get('deleteCount', 0)}, " f"проверок — {len(checks)}, {push_text}. После нажатия devctl применит патч, выполнит проверки, сделает commit и при необходимости push.", "Запустить конвейер", "ok")
 
     def _recommend_after_result(self, data: dict, result: RunResult) -> None:
         status = data.get("status") if isinstance(data, dict) else None
         if result.returncode == 0:
             uts_project = data.get("utsProjectDir") if isinstance(data, dict) else None
             if uts_project:
-                self._set_next_action(
-                    "open_uts",
-                    "Открыть свежую UTS-копию",
-                    f"Конвейер завершился со статусом {status or 'OK'}. Успешный post-снимок уже развёрнут для ручного тестирования: {uts_project}",
-                    "Открыть UTS",
-                    "ok",
-                )
+                self._set_next_action("open_uts", "Открыть свежую UTS-копию", f"Конвейер завершился со статусом {status or 'OK'}. Успешный post-снимок уже развёрнут для ручного тестирования: {uts_project}", "Открыть UTS", "ok")
                 return
-            self._set_next_action(
-                "open_report",
-                "Открыть отчёт успешного запуска",
-                f"Конвейер завершился со статусом {status or 'OK'}. Отчёт уже создан и содержит commit/push-сводку.",
-                "Открыть отчёт",
-                "ok",
-            )
+            self._set_next_action("open_report", "Открыть отчёт успешного запуска", f"Конвейер завершился со статусом {status or 'OK'}. Отчёт уже создан и содержит commit/push-сводку.", "Открыть отчёт", "ok")
         else:
-            self._set_next_action(
-                "open_report",
-                "Разобрать ошибку по отчёту",
-                f"Конвейер остановился со статусом {status or 'ошибка'}. Откройте отчёт: там есть ошибки, предупреждения и путь к диагностическому архиву.",
-                "Открыть отчёт",
-                "bad",
-            )
+            self._set_next_action("open_report", "Разобрать ошибку по отчёту", f"Конвейер остановился со статусом {status or 'ошибка'}. Откройте отчёт: там есть ошибки, предупреждения и путь к диагностическому архиву.", "Открыть отчёт", "bad")
 
     def show_git_status(self) -> None:
         data = self.last_status or {}
         git = data.get("git", {}) if isinstance(data, dict) else {}
         workspace = data.get("workspace", {}) if isinstance(data, dict) else {}
         porcelain = git.get("porcelain") or git.get("statusShort") or ""
-        lines = [
-            "== git status ==",
-            f"Project: {workspace.get('projectRoot') or 'неизвестно'}",
-            f"Ветка: {git.get('branch') or 'неизвестно'}",
-            "",
-        ]
+        lines = ["== git status ==", f"Project: {workspace.get('projectRoot') or 'неизвестно'}", f"Ветка: {git.get('branch') or 'неизвестно'}", ""]
         if porcelain.strip():
             lines.append(porcelain.rstrip())
         else:
             lines.append("Локальные изменения не перечислены в status JSON. Откройте project/ и выполните git status вручную.")
-        lines.extend([
-            "",
-            "Перед запуском devctl приведите рабочее дерево к чистому состоянию: закоммитьте нужное, уберите временное или откатите лишнее.",
-        ])
+        lines.extend(["", "Перед запуском devctl приведите рабочее дерево к чистому состоянию: закоммитьте нужное, уберите временное или откатите лишнее."])
         self.set_text(self.plan_text, "\n".join(lines) + "\n")
-        self.notebook.select(0)
+        self.notebook.setCurrentIndex(0)
 
-    def _current_output_widget(self) -> tuple[str, tk.Text]:
-        selected = self.notebook.select()
-        tabs = [
-            ("План", self.plan_text),
-            ("Запуск", self.run_text),
-            ("Отчёт", self.report_text),
-        ]
-        for title, widget in tabs:
-            if str(widget.master) == selected:
-                return title, widget
+    def _current_output_widget(self) -> tuple[str, QtWidgets.QPlainTextEdit]:
+        index = self.notebook.currentIndex()
+        if 0 <= index < len(self._text_tabs):
+            return self._text_tabs[index]
         return "План", self.plan_text
 
     def copy_current_output(self) -> None:
-        """Надёжно копирует весь текст активной вкладки вывода.
-
-        Копирование выделения из disabled Text в Tkinter на Windows может вести
-        себя нестабильно. Эта кнопка читает содержимое виджета напрямую и
-        кладёт его в clipboard независимо от selection/focus/state.
-        """
         title, widget = self._current_output_widget()
-        text = widget.get("1.0", "end-1c")
+        text = widget.toPlainText()
         if not text.strip():
-            messagebox.showinfo(APP_NAME, f"Во вкладке «{title}» пока нет текста для копирования.", parent=self)
+            QtWidgets.QMessageBox.information(self, APP_NAME, f"Во вкладке «{title}» пока нет текста для копирования.")
             return
-        self.clipboard_clear()
-        self.clipboard_append(text)
-        self.update()
-        messagebox.showinfo(APP_NAME, f"Текущий вывод вкладки «{title}» скопирован в буфер обмена.", parent=self)
+        QtWidgets.QApplication.clipboard().setText(text)
+        QtWidgets.QMessageBox.information(self, APP_NAME, f"Текущий вывод вкладки «{title}» скопирован в буфер обмена.")
 
     def copy_patch_prompt(self) -> None:
-        """Копирует в буфер обмена шаблон запроса для новой ChatGPT-сессии."""
         text = PATCH_PROMPT_TEMPLATE.strip() + "\n"
-        self.clipboard_clear()
-        self.clipboard_append(text)
-        self.update()
-        self.set_text(
-            self.report_text,
-            "== prompt-шаблон devctl-патча ==\n\n"
-            "Шаблон скопирован в буфер обмена. Его можно вставить в новую ChatGPT-сессию, "
-            "чтобы попросить собрать корректный devctl-патч для этого workspace.\n\n"
-            + text,
-        )
-        self.notebook.select(2)
-        messagebox.showinfo(APP_NAME, "Prompt-шаблон для devctl-патча скопирован в буфер обмена.", parent=self)
+        QtWidgets.QApplication.clipboard().setText(text)
+        self.set_text(self.report_text, "== prompt-шаблон devctl-патча ==\n\nШаблон скопирован в буфер обмена. Его можно вставить в новую ChatGPT-сессию, чтобы попросить собрать корректный devctl-патч для этого workspace.\n\n" + text)
+        self.notebook.setCurrentIndex(2)
+        QtWidgets.QMessageBox.information(self, APP_NAME, "Prompt-шаблон для devctl-патча скопирован в буфер обмена.")
 
     def choose_workspace(self) -> None:
-        selected = filedialog.askdirectory(title="Выберите корень рабочей области devctl")
+        selected = QtWidgets.QFileDialog.getExistingDirectory(self, "Выберите корень рабочей области devctl")
         if not selected:
             return
-        self.workspace_var.set(selected)
+        self.path_entry.setText(selected)
         self._save_workspace()
         self.refresh_status()
 
     def init_workspace(self) -> None:
-        current = Path(self.workspace_var.get()).expanduser()
+        current = Path(self.path_entry.text()).expanduser()
         initial_parent = current.parent if current.name else Path.home()
         dialog = InitWorkspaceDialog(self, initial_parent=initial_parent)
-        self.wait_window(dialog)
-        request = dialog.result
-        if not request:
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted or not dialog.result:
             return
-
+        request = dialog.result
         parent = Path(request["parent"]).expanduser().resolve()
         workspace = (parent / request["name"]).resolve()
         remote_url = request.get("remoteUrl", "").strip()
         branch = request.get("branch", "main").strip() or "main"
-
         try:
             parent.mkdir(parents=True, exist_ok=True)
             if workspace.exists() and any(workspace.iterdir()):
-                messagebox.showerror(
-                    APP_NAME,
-                    "Папка workspace уже существует и не пуста.\n\n"
-                    f"{workspace}\n\n"
-                    "Выберите другое название или пустую директорию, чтобы GUI ничего случайно не перезаписал.",
-                )
+                QtWidgets.QMessageBox.critical(self, APP_NAME, "Папка workspace уже существует и не пуста.\n\n" f"{workspace}\n\n" "Выберите другое название или пустую директорию, чтобы GUI ничего случайно не перезаписал.")
                 return
             workspace.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
-            messagebox.showerror(APP_NAME, f"Не удалось подготовить папку workspace:\n{workspace}\n\n{exc}")
+            QtWidgets.QMessageBox.critical(self, APP_NAME, f"Не удалось подготовить папку workspace:\n{workspace}\n\n{exc}")
             return
-
         self.set_running(True)
-        self.set_text(
-            self.report_text,
-            "Инициализирую workspace...\n\n"
-            f"Workspace: {workspace}\n"
-            f"Project:   {workspace / 'project'}\n"
-            f"Remote:    {remote_url or 'не задан'}\n",
-        )
-        self.notebook.select(2)
-
-        args = [
-            "init",
-            "--json",
-            "--workspace", str(workspace),
-            "--project", "project",
-            "--patches", "patches",
-            "--archives", "archives",
-            "--uts", "UserTestSpace",
-            "--create-project",
-            "--git-init",
-            "--branch", branch,
-        ]
+        self.set_text(self.report_text, "Инициализирую workspace...\n\n" f"Workspace: {workspace}\n" f"Project:   {workspace / 'project'}\n" f"Remote:    {remote_url or 'не задан'}\n")
+        self.notebook.setCurrentIndex(2)
+        args = ["init", "--json", "--workspace", str(workspace), "--project", "project", "--patches", "patches", "--archives", "archives", "--uts", "UserTestSpace", "--create-project", "--git-init", "--branch", branch]
         if remote_url:
             args.extend(["--remote-url", remote_url])
-
         init_runner = DevctlRunner(workspace)
-        self._run_async(
-            args,
-            lambda result, target=workspace: self._on_init_workspace_done(result, target),
-            runner=init_runner,
-            save_workspace=False,
-        )
+        self._run_async(args, lambda result, target=workspace: self._on_init_workspace_done(result, target), runner=init_runner, save_workspace=False)
 
     def _on_init_workspace_done(self, result: RunResult, workspace: Path) -> None:
         self.set_running(False)
         data = result.json_data or {}
         self.set_text(self.report_text, self._format_init_result(data if isinstance(data, dict) else {}, result, workspace))
         if result.ok and isinstance(data, dict) and data.get("ok"):
-            self.workspace_var.set(str(workspace))
+            self.path_entry.setText(str(workspace))
             self._save_workspace()
             self.last_report_path = None
             self.last_archive_path = None
             self.refresh_status()
-            messagebox.showinfo(APP_NAME, "Workspace создан и открыт в GUI.")
+            QtWidgets.QMessageBox.information(self, APP_NAME, "Workspace создан и открыт в GUI.")
         else:
-            messagebox.showerror(APP_NAME, "Инициализация workspace завершилась с ошибкой. Подробности во вкладке «Отчёт».")
+            QtWidgets.QMessageBox.critical(self, APP_NAME, "Инициализация workspace завершилась с ошибкой. Подробности во вкладке «Отчёт».")
 
     def _format_init_result(self, data: dict, result: RunResult, workspace: Path) -> str:
         if not data:
             return (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
         git_data = data.get("git") if isinstance(data.get("git"), dict) else {}
-        lines = [
-            "== инициализация workspace ==",
-            f"Статус: {'OK' if data.get('ok') else 'ошибка'}",
-            f"Код возврата: {result.returncode}",
-            f"Workspace: {data.get('workspaceRoot') or workspace}",
-            f"Project: {data.get('projectRoot') or workspace / 'project'}",
-            f"Patches: {data.get('patchesDir') or workspace / 'patches'}",
-            f"Archives: {data.get('archivesDir') or workspace / 'archives'}",
-            f"UTS: {data.get('userTestSpaceDir') or workspace / 'UserTestSpace'}",
-            f"Config: {data.get('configPath') or workspace / '.devctl' / 'workspace.json'}",
-            "",
-            "== git ==",
-            f"Git доступен: {git_data.get('available')}",
-            f"Репозиторий создан: {git_data.get('initialized')}",
-            f"Ветка: {git_data.get('branch') or 'неизвестно'}",
-            f"Remote origin: {git_data.get('remoteUrl') or 'не задан'}",
-            f"Remote связан: {git_data.get('remoteLinked')}",
-            f"Операция: {git_data.get('operation') or 'нет'}",
-            f"Синхронизация remote: {git_data.get('synced')}",
-            f"Pull выполнен: {git_data.get('pulled')}",
-            f"Pull пропущен: {git_data.get('pullSkipped')}",
-            "",
-            "== создано ==",
-        ]
-        created = data.get("created") or []
-        lines.extend([f"- {item}" for item in created] or ["всё уже существовало"])
+        lines = ["== инициализация workspace ==", f"Статус: {'OK' if data.get('ok') else 'ошибка'}", f"Код возврата: {result.returncode}", f"Workspace: {data.get('workspaceRoot') or workspace}", f"Project: {data.get('projectRoot') or workspace / 'project'}", f"Patches: {data.get('patchesDir') or workspace / 'patches'}", f"Archives: {data.get('archivesDir') or workspace / 'archives'}", f"UTS: {data.get('userTestSpaceDir') or workspace / 'UserTestSpace'}", f"Config: {data.get('configPath') or workspace / '.devctl' / 'workspace.json'}", "", "== git ==", f"Git доступен: {git_data.get('available')}", f"Репозиторий создан: {git_data.get('initialized')}", f"Ветка: {git_data.get('branch') or 'неизвестно'}", f"Remote origin: {git_data.get('remoteUrl') or 'не задан'}", f"Remote связан: {git_data.get('remoteLinked')}", f"Операция: {git_data.get('operation') or 'нет'}", f"Синхронизация remote: {git_data.get('synced')}", f"Pull выполнен: {git_data.get('pulled')}", f"Pull пропущен: {git_data.get('pullSkipped')}", "", "== создано =="]
+        lines.extend([f"- {item}" for item in data.get("created") or []] or ["всё уже существовало"])
         operations = git_data.get("operations") if isinstance(git_data, dict) else []
-        lines.append("")
-        lines.append("== git-шаги ==")
+        lines.append(""); lines.append("== git-шаги ==")
         lines.extend([f"- {item}" for item in operations] or ["нет"])
         warnings = data.get("warnings") or []
-        lines.append("")
-        lines.append("== предупреждения ==")
+        lines.append(""); lines.append("== предупреждения ==")
         lines.extend([f"- {item}" for item in warnings] or ["нет"])
         errors = []
         if data.get("error"):
             errors.append(data.get("error"))
         if isinstance(git_data, dict):
             errors.extend(git_data.get("errors") or [])
-        lines.append("")
-        lines.append("== ошибки ==")
+        lines.append(""); lines.append("== ошибки ==")
         lines.extend([f"- {item}" for item in errors] or ["нет"])
         return "\n".join(lines) + "\n"
 
     def sync_workspace(self) -> None:
         self._save_workspace()
-        proceed = messagebox.askyesno(
-            APP_NAME,
-            "Синхронизировать workspace с GitHub как источником истины?\n\n"
-            "GUI вызовет `devctl sync --discard-local --json`: project/ будет приведён к origin/ветке через fetch + reset --hard + git clean, затем devctl создаст свежий архив в archives/ и развернёт копию в UserTestSpace/.\n\n"
-            "Локальные незакоммиченные изменения и локальные commit'ы, которых нет в remote, могут быть отброшены.",
-            parent=self,
-        )
-        if not proceed:
+        if not self._confirm("Синхронизировать workspace с GitHub как источником истины?\n\nGUI вызовет `devctl sync --discard-local --json`: project/ будет приведён к origin/ветке через fetch + reset --hard + git clean, затем devctl создаст свежий архив в archives/ и развернёт копию в UserTestSpace/.\n\nЛокальные незакоммиченные изменения и локальные commit'ы, которых нет в remote, могут быть отброшены."):
             return
         self.set_running(True)
-        self.set_text(
-            self.report_text,
-            "Синхронизирую workspace с GitHub как источником истины...\n\n"
-            "Команда: devctl sync --discard-local --json\n"
-            "Этапы: fetch/reset/clean -> свежий archives/ snapshot -> свежий UserTestSpace/.\n",
-        )
-        self.notebook.select(2)
+        self.set_text(self.report_text, "Синхронизирую workspace с GitHub как источником истины...\n\nКоманда: devctl sync --discard-local --json\nЭтапы: fetch/reset/clean -> свежий archives/ snapshot -> свежий UserTestSpace/.\n")
+        self.notebook.setCurrentIndex(2)
         self._run_async(["sync", "--discard-local", "--json"], self._on_sync_workspace_done, timeout=900)
 
     def _on_sync_workspace_done(self, result: RunResult) -> None:
@@ -1188,12 +1020,12 @@ class DevctlGui(tk.Tk):
             self.set_text(self.report_text, self._format_sync_result(data, result))
         else:
             self.set_text(self.report_text, result.stdout + ("\n" + result.stderr if result.stderr else ""))
-        self.notebook.select(2)
+        self.notebook.setCurrentIndex(2)
         self.refresh_status()
         if result.ok and isinstance(data, dict) and data.get("ok"):
-            messagebox.showinfo(APP_NAME, "Workspace синхронизирован: project, archives и UserTestSpace актуализированы.", parent=self)
+            QtWidgets.QMessageBox.information(self, APP_NAME, "Workspace синхронизирован: project, archives и UserTestSpace актуализированы.")
         else:
-            messagebox.showerror(APP_NAME, "Не удалось синхронизировать workspace. Подробности во вкладке «Отчёт».", parent=self)
+            QtWidgets.QMessageBox.critical(self, APP_NAME, "Не удалось синхронизировать workspace. Подробности во вкладке «Отчёт».")
 
     def _format_sync_result(self, data: dict, result: RunResult) -> str:
         if not data:
@@ -1202,48 +1034,19 @@ class DevctlGui(tk.Tk):
         git = data.get("git") if isinstance(data.get("git"), dict) else {}
         archive = data.get("archive") if isinstance(data.get("archive"), dict) else {}
         uts = data.get("uts") if isinstance(data.get("uts"), dict) else {}
-        lines = [
-            "== sync workspace ==",
-            f"Статус: {'OK' if data.get('ok') else 'ошибка'}",
-            f"Код возврата: {result.returncode}",
-            f"Workspace: {workspace.get('workspaceRoot') or 'неизвестно'}",
-            f"Project: {workspace.get('projectRoot') or 'неизвестно'}",
-            "",
-            "== git ==",
-            f"Remote: {git.get('remote') or 'origin'}",
-            f"Remote URL: {git.get('remoteUrl') or 'не задан'}",
-            f"Ветка: {git.get('branch') or 'неизвестно'}",
-            f"Discard local: {git.get('discardLocal')}",
-            f"Head after: {git.get('headAfter') or 'нет'}",
-            f"Clean after: {git.get('cleanAfter')}",
-            "",
-            "== git-шаги ==",
-        ]
-        operations = git.get("operations") or []
-        lines.extend([f"- {item}" for item in operations] or ["нет"])
-        lines.extend([
-            "",
-            "== archives / UTS ==",
-            f"Архив: {archive.get('path') or 'не создавался'}",
-            f"Файлов в архиве: {archive.get('fileCount', 0)}",
-            f"UTS project: {uts.get('projectDir') or 'не обновлялся'}",
-            "",
-            "== создано ==",
-        ])
-        created = data.get("created") or []
-        lines.extend([f"- {item}" for item in created] or ["служебные папки уже существовали"])
+        lines = ["== sync workspace ==", f"Статус: {'OK' if data.get('ok') else 'ошибка'}", f"Код возврата: {result.returncode}", f"Workspace: {workspace.get('workspaceRoot') or 'неизвестно'}", f"Project: {workspace.get('projectRoot') or 'неизвестно'}", "", "== git ==", f"Remote: {git.get('remote') or 'origin'}", f"Remote URL: {git.get('remoteUrl') or 'не задан'}", f"Ветка: {git.get('branch') or 'неизвестно'}", f"Discard local: {git.get('discardLocal')}", f"Head after: {git.get('headAfter') or 'нет'}", f"Clean after: {git.get('cleanAfter')}", "", "== git-шаги =="]
+        lines.extend([f"- {item}" for item in git.get("operations") or []] or ["нет"])
+        lines.extend(["", "== archives / UTS ==", f"Архив: {archive.get('path') or 'не создавался'}", f"Файлов в архиве: {archive.get('fileCount', 0)}", f"UTS project: {uts.get('projectDir') or 'не обновлялся'}", "", "== создано =="])
+        lines.extend([f"- {item}" for item in data.get("created") or []] or ["служебные папки уже существовали"])
         warnings = []
-        warnings.extend(data.get("warnings") or [])
-        warnings.extend(git.get("warnings") or [])
-        lines.append("")
-        lines.append("== предупреждения ==")
+        warnings.extend(data.get("warnings") or []); warnings.extend(git.get("warnings") or [])
+        lines.append(""); lines.append("== предупреждения ==")
         lines.extend([f"- {item}" for item in warnings] or ["нет"])
         errors = []
         if data.get("error"):
             errors.append(data.get("error"))
         errors.extend(git.get("errors") or [])
-        lines.append("")
-        lines.append("== ошибки ==")
+        lines.append(""); lines.append("== ошибки ==")
         lines.extend([f"- {item}" for item in errors] or ["нет"])
         return "\n".join(lines) + "\n"
 
@@ -1251,7 +1054,7 @@ class DevctlGui(tk.Tk):
         self._save_workspace()
         self.set_running(True)
         self.set_text(self.report_text, "Забираю patch.zip из Patch Inbox...\n")
-        self.notebook.select(2)
+        self.notebook.setCurrentIndex(2)
         args = ["inbox", "grab", "--json"]
         if workspace_id:
             args.extend(["--workspace", workspace_id])
@@ -1264,92 +1067,51 @@ class DevctlGui(tk.Tk):
             self.set_text(self.report_text, self._format_inbox_grab_result(data, result))
             imported = [item for item in (data.get("results") or []) if isinstance(item, dict) and item.get("status") == "imported"]
             if imported:
-                self._set_next_action(
-                    "build_plan",
-                    "Патч импортирован в patches/",
-                    "Patch Intake только доставил архив. Следующий безопасный шаг — построить dry-run план и уже потом запускать конвейер.",
-                    "Построить план",
-                    "ok",
-                )
-                messagebox.showinfo(APP_NAME, "Патч импортирован. Теперь можно построить план.", parent=self)
+                self._set_next_action("build_plan", "Патч импортирован в patches/", "Patch Intake только доставил архив. Следующий безопасный шаг — построить dry-run план и уже потом запускать конвейер.", "Построить план", "ok")
+                QtWidgets.QMessageBox.information(self, APP_NAME, "Патч импортирован. Теперь можно построить план.")
             else:
-                self._set_next_action(
-                    "refresh_status",
-                    "Patch Inbox обработан",
-                    "Импорт не создал нового patch.zip для запуска. Проверьте отчёт и обновите статус.",
-                    "Обновить статус",
-                    "warn",
-                )
+                self._set_next_action("refresh_status", "Patch Inbox обработан", "Импорт не создал нового patch.zip для запуска. Проверьте отчёт и обновите статус.", "Обновить статус", "warn")
             self.refresh_status()
             return
-
         self.set_text(self.report_text, self._format_inbox_grab_result(data if isinstance(data, dict) else {}, result))
         if allow_choice:
-            self.set_text(self.report_text, self.report_text.get("1.0", "end") + "\nПробую получить список workspace для ручного выбора...\n")
+            self.set_text(self.report_text, self.report_text.toPlainText() + "\nПробую получить список workspace для ручного выбора...\n")
             self.set_running(True)
             self._run_async(["inbox", "scan", "--json"], self._on_inbox_scan_for_choice, timeout=120)
             return
-
-        self._set_next_action(
-            "grab_inbox_patch",
-            "Не удалось забрать патч из склада",
-            result.stderr or result.stdout or "Проверьте, настроен ли Patch Inbox (`devctl inbox init`) и зарегистрирован ли workspace (`devctl workspace register`).",
-            "Повторить inbox grab",
-            "bad",
-        )
-        messagebox.showerror(APP_NAME, "Не удалось забрать патч. Подробности во вкладке «Отчёт».", parent=self)
+        self._set_next_action("grab_inbox_patch", "Не удалось забрать патч из склада", result.stderr or result.stdout or "Проверьте, настроен ли Patch Inbox (`devctl inbox init`) и зарегистрирован ли workspace (`devctl workspace register`).", "Повторить inbox grab", "bad")
+        QtWidgets.QMessageBox.critical(self, APP_NAME, "Не удалось забрать патч. Подробности во вкладке «Отчёт».")
 
     def _on_inbox_scan_for_choice(self, result: RunResult) -> None:
         self.set_running(False)
         data = result.json_data or {}
         if not isinstance(data, dict) or not data.get("ok"):
             self.set_text(self.report_text, (result.stdout or "") + ("\n" + result.stderr if result.stderr else ""))
-            messagebox.showerror(APP_NAME, "Не удалось получить список workspace для выбора.", parent=self)
+            QtWidgets.QMessageBox.critical(self, APP_NAME, "Не удалось получить список workspace для выбора.")
             return
         self.set_text(self.report_text, self._format_inbox_scan_result(data, result))
         workspaces = data.get("workspaces") if isinstance(data.get("workspaces"), list) else []
         if not workspaces:
-            self._set_next_action(
-                "refresh_status",
-                "Workspace не зарегистрированы для Patch Intake",
-                "Выполните в нужном workspace: `devctl workspace register . --id <id>` и повторите импорт.",
-                "Обновить статус",
-                "bad",
-            )
-            messagebox.showerror(APP_NAME, "Нет зарегистрированных workspace для Patch Intake.", parent=self)
+            self._set_next_action("refresh_status", "Workspace не зарегистрированы для Patch Intake", "Выполните в нужном workspace: `devctl workspace register . --id <id>` и повторите импорт.", "Обновить статус", "bad")
+            QtWidgets.QMessageBox.critical(self, APP_NAME, "Нет зарегистрированных workspace для Patch Intake.")
             return
         dialog = WorkspaceChoiceDialog(self, workspaces=workspaces)
-        self.wait_window(dialog)
-        if not dialog.result:
-            self._set_next_action(
-                "grab_inbox_patch",
-                "Импорт патча отменён",
-                "Выбор workspace был отменён. Patch.zip остался в исходном складе.",
-                "Забрать патч из склада",
-                "warn",
-            )
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted or not dialog.result:
+            self._set_next_action("grab_inbox_patch", "Импорт патча отменён", "Выбор workspace был отменён. Patch.zip остался в исходном складе.", "Забрать патч из склада", "warn")
             return
         self.grab_inbox_patch(dialog.result, allow_choice=False)
 
     def _format_inbox_scan_result(self, data: dict, result: RunResult) -> str:
         if not data:
             return (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
-        lines = [
-            "== Patch Inbox scan ==",
-            f"devctl: v{data.get('version')}",
-            f"Config: {data.get('configPath')}",
-            "",
-            "== склады ==",
-        ]
+        lines = ["== Patch Inbox scan ==", f"devctl: v{data.get('version')}", f"Config: {data.get('configPath')}", "", "== склады =="]
         lines.extend([f"- {item}" for item in data.get("patchInboxDirs") or []] or ["не настроены"])
-        lines.append("")
-        lines.append("== зарегистрированные workspace ==")
+        lines.append(""); lines.append("== зарегистрированные workspace ==")
         for record in data.get("workspaces") or []:
             lines.append(f"- {record.get('id')} · {record.get('name')} · {record.get('path')}")
         if not data.get("workspaces"):
             lines.append("нет")
-        lines.append("")
-        lines.append("== патчи ==")
+        lines.append(""); lines.append("== патчи ==")
         patches = data.get("patches") if isinstance(data.get("patches"), dict) else {}
         for item in patches.get("items") or []:
             target = item.get("target") if isinstance(item.get("target"), dict) else {}
@@ -1361,15 +1123,7 @@ class DevctlGui(tk.Tk):
     def _format_inbox_grab_result(self, data: dict, result: RunResult) -> str:
         if not data:
             return (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
-        lines = [
-            "== Patch Inbox grab ==",
-            f"Статус: {'OK' if data.get('ok') else 'ошибка'}",
-            f"Dry-run: {data.get('dryRun')}",
-            f"Config: {data.get('configPath')}",
-            f"Index: {data.get('indexPath')}",
-            "",
-            "== результаты ==",
-        ]
+        lines = ["== Patch Inbox grab ==", f"Статус: {'OK' if data.get('ok') else 'ошибка'}", f"Dry-run: {data.get('dryRun')}", f"Config: {data.get('configPath')}", f"Index: {data.get('indexPath')}", "", "== результаты =="]
         results = data.get("results") if isinstance(data.get("results"), list) else []
         for item in results:
             if not isinstance(item, dict):
@@ -1388,113 +1142,73 @@ class DevctlGui(tk.Tk):
         if not results:
             lines.append("нет")
         errors = data.get("errors") if isinstance(data.get("errors"), list) else []
-        lines.append("")
-        lines.append("== ошибки ==")
+        lines.append(""); lines.append("== ошибки ==")
         lines.extend([f"- {item}" for item in errors] or [result.stderr or result.stdout or "нет"])
         return "\n".join(lines) + "\n"
 
     def upgrade_workspace(self) -> None:
         self._save_workspace()
-        proceed = messagebox.askyesno(
-            APP_NAME,
-            "Безопасно обновить структуру workspace?\n\n"
-            "GUI вызовет `devctl init --upgrade`: команда добавляет недостающие поля конфигурации и служебные папки вроде UserTestSpace/, но не трогает содержимое project/.",
-            parent=self,
-        )
-        if not proceed:
+        if not self._confirm("Безопасно обновить структуру workspace?\n\nGUI вызовет `devctl init --upgrade`: команда добавляет недостающие поля конфигурации и служебные папки вроде UserTestSpace/, но не трогает содержимое project/."):
             return
         self.set_running(True)
         self.set_text(self.report_text, "Обновляю структуру workspace через devctl init --upgrade...\n")
-        self.notebook.select(2)
-        self._run_async(["init", "--upgrade", "--json", "--workspace", self.workspace_var.get()], self._on_upgrade_workspace_done)
+        self.notebook.setCurrentIndex(2)
+        self._run_async(["init", "--upgrade", "--json", "--workspace", self.path_entry.text()], self._on_upgrade_workspace_done)
 
     def _on_upgrade_workspace_done(self, result: RunResult) -> None:
         self.set_running(False)
         data = result.json_data or {}
         self.set_text(self.report_text, self._format_upgrade_result(data if isinstance(data, dict) else {}, result))
-        self.notebook.select(2)
+        self.notebook.setCurrentIndex(2)
         self.refresh_status()
         if result.ok and isinstance(data, dict) and data.get("ok"):
-            messagebox.showinfo(APP_NAME, "Структура workspace обновлена.", parent=self)
+            QtWidgets.QMessageBox.information(self, APP_NAME, "Структура workspace обновлена.")
         else:
-            messagebox.showerror(APP_NAME, "Не удалось обновить структуру workspace. Подробности во вкладке «Отчёт».", parent=self)
+            QtWidgets.QMessageBox.critical(self, APP_NAME, "Не удалось обновить структуру workspace. Подробности во вкладке «Отчёт».")
 
     def _format_upgrade_result(self, data: dict, result: RunResult) -> str:
         if not data:
             return (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
-        lines = [
-            "== обновление структуры workspace ==",
-            f"Статус: {'OK' if data.get('ok') else 'ошибка'}",
-            f"Код возврата: {result.returncode}",
-            f"Workspace: {data.get('workspaceRoot')}",
-            f"Config: {data.get('configPath')}",
-            f"Config изменён: {data.get('changed')}",
-            "",
-            "== создано ==",
-        ]
+        lines = ["== обновление структуры workspace ==", f"Статус: {'OK' if data.get('ok') else 'ошибка'}", f"Код возврата: {result.returncode}", f"Workspace: {data.get('workspaceRoot')}", f"Config: {data.get('configPath')}", f"Config изменён: {data.get('changed')}", "", "== создано =="]
         lines.extend([f"- {item}" for item in data.get("created") or []] or ["ничего"])
-        lines.append("")
-        lines.append("== обновлённые поля/исключения ==")
+        lines.append(""); lines.append("== обновлённые поля/исключения ==")
         lines.extend([f"- {item}" for item in data.get("updatedFields") or []] or ["уже актуально"])
-        warnings = data.get("warnings") or []
-        lines.append("")
-        lines.append("== предупреждения ==")
-        lines.extend([f"- {item}" for item in warnings] or ["нет"])
+        lines.append(""); lines.append("== предупреждения ==")
+        lines.extend([f"- {item}" for item in data.get("warnings") or []] or ["нет"])
         if data.get("error"):
             lines.extend(["", "== ошибка ==", str(data.get("error"))])
         return "\n".join(lines) + "\n"
 
     def reset_project(self) -> None:
         self._save_workspace()
-        proceed = messagebox.askyesno(
-            APP_NAME,
-            "Откатить project/?\n\n"
-            "Будет выполнен `devctl reset`: git reset --hard HEAD и git clean -fd. "
-            "Локальные незакоммиченные изменения и untracked-файлы в project/ будут удалены.",
-            parent=self,
-        )
-        if not proceed:
+        if not self._confirm("Откатить project/?\n\nБудет выполнен `devctl reset`: git reset --hard HEAD и git clean -fd. Локальные незакоммиченные изменения и untracked-файлы в project/ будут удалены."):
             return
         self.set_running(True)
         self.set_text(self.report_text, "Выполняю devctl reset...\n")
-        self.notebook.select(2)
+        self.notebook.setCurrentIndex(2)
         self._run_async(["reset", "--json"], self._on_reset_done)
 
     def _on_reset_done(self, result: RunResult) -> None:
         self.set_running(False)
         data = result.json_data or {}
         self.set_text(self.report_text, self._format_reset_result(data if isinstance(data, dict) else {}, result))
-        self.notebook.select(2)
+        self.notebook.setCurrentIndex(2)
         self.refresh_status()
         if result.ok and isinstance(data, dict) and data.get("ok"):
-            messagebox.showinfo(APP_NAME, "project/ откатан и очищен.", parent=self)
+            QtWidgets.QMessageBox.information(self, APP_NAME, "project/ откатан и очищен.")
         else:
-            messagebox.showerror(APP_NAME, "devctl reset завершился с ошибкой. Подробности во вкладке «Отчёт».", parent=self)
+            QtWidgets.QMessageBox.critical(self, APP_NAME, "devctl reset завершился с ошибкой. Подробности во вкладке «Отчёт».")
 
     def _format_reset_result(self, data: dict, result: RunResult) -> str:
         if not data:
             return (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
-        lines = [
-            "== reset project ==",
-            f"Статус: {'OK' if data.get('ok') else 'ошибка'}",
-            f"Код возврата: {result.returncode}",
-            f"Project: {data.get('projectRoot')}",
-            f"Target: {data.get('target')}",
-            f"Clean mode: {data.get('cleanMode')}",
-            f"Patch удалён: {data.get('patchDeleted') or 'нет'}",
-            "",
-            "== git status before ==",
-            data.get("gitStatusBefore") or "clean/нет данных",
-            "",
-            "== git status after ==",
-            data.get("gitStatusAfter") or "clean",
-        ]
+        lines = ["== reset project ==", f"Статус: {'OK' if data.get('ok') else 'ошибка'}", f"Код возврата: {result.returncode}", f"Project: {data.get('projectRoot')}", f"Target: {data.get('target')}", f"Clean mode: {data.get('cleanMode')}", f"Patch удалён: {data.get('patchDeleted') or 'нет'}", "", "== git status before ==", data.get("gitStatusBefore") or "clean/нет данных", "", "== git status after ==", data.get("gitStatusAfter") or "clean"]
         if data.get("error"):
             lines.extend(["", "== ошибка ==", str(data.get("error"))])
         return "\n".join(str(item) for item in lines) + "\n"
 
     def _save_workspace(self) -> None:
-        workspace = str(Path(self.workspace_var.get()).expanduser().resolve())
+        workspace = str(Path(self.path_entry.text()).expanduser().resolve())
         if not looks_like_pyinstaller_temp(Path(workspace)):
             self.config_data["lastWorkspace"] = workspace
             save_config(self.config_data)
@@ -1504,11 +1218,9 @@ class DevctlGui(tk.Tk):
         if save_workspace:
             self._save_workspace()
         active_runner = runner or self.runner
-
         def worker() -> None:
             result = active_runner.run(args, timeout=timeout)
             self.events.put(("result", (callback, result)))
-
         threading.Thread(target=worker, daemon=True).start()
 
     def refresh_status(self) -> None:
@@ -1522,21 +1234,15 @@ class DevctlGui(tk.Tk):
     def _on_status(self, result: RunResult) -> None:
         data = result.json_data or {}
         self.last_status = data if isinstance(data, dict) else None
-        if not data.get("ok"):
-            text = result.stderr or result.stdout or data.get("error") or "Не удалось получить статус."
+        if not isinstance(data, dict) or not data.get("ok"):
+            text = result.stderr or result.stdout or (data.get("error") if isinstance(data, dict) else None) or "Не удалось получить статус."
             self.cards["project"].set("ошибка", "bad")
             self.cards["git"].set("недоступно", "bad")
             self.cards["patch"].set("неизвестно", "warn")
             self.cards["uts"].set("неизвестно", "warn")
             self.cards["push"].set("неизвестно", "warn")
-            self._set_next_action(
-                "choose_workspace",
-                "Выбрать корректную рабочую область",
-                str(text),
-                "Выбрать workspace",
-                "bad",
-            )
-            self.set_text(self.plan_text, text)
+            self._set_next_action("choose_workspace", "Выбрать корректную рабочую область", str(text), "Выбрать workspace", "bad")
+            self.set_text(self.plan_text, str(text))
             return
         workspace = data.get("workspace", {})
         git = data.get("git", {})
@@ -1549,18 +1255,11 @@ class DevctlGui(tk.Tk):
         else:
             self.cards["git"].set("чисто" if git.get("clean") else "есть изменения", "ok" if git.get("clean") else "warn")
         if latest:
-            kind = "bad" if latest.get("manifestError") else "ok"
-            self.cards["patch"].set(latest.get("title") or latest.get("name") or "найден", kind)
+            self.cards["patch"].set(latest.get("title") or latest.get("name") or "найден", "bad" if latest.get("manifestError") else "ok")
         else:
             patches = data.get("patches", {}) if isinstance(data.get("patches"), dict) else {}
-            if patches.get("count"):
-                self.cards["patch"].set("нет новых", "ok")
-            else:
-                self.cards["patch"].set("нет патчей", "warn")
-        if workspace.get("userTestSpaceDirExists"):
-            self.cards["uts"].set("готов", "ok")
-        else:
-            self.cards["uts"].set("нужно обновить", "warn")
+            self.cards["patch"].set("нет новых" if patches.get("count") else "нет патчей", "ok" if patches.get("count") else "warn")
+        self.cards["uts"].set("готов" if workspace.get("userTestSpaceDirExists") else "нужно обновить", "ok" if workspace.get("userTestSpaceDirExists") else "warn")
         self.cards["push"].set("см. план" if latest else "неизвестно", "neutral")
         self._recommend_from_status(data)
         self.set_text(self.plan_text, self._format_status(data))
@@ -1568,63 +1267,27 @@ class DevctlGui(tk.Tk):
     def _on_plan(self, result: RunResult) -> None:
         data = result.json_data or {}
         self.last_plan = data if isinstance(data, dict) else None
-        self.set_text(self.plan_text, self._format_plan(data, result))
+        self.set_text(self.plan_text, self._format_plan(data if isinstance(data, dict) else {}, result))
         push = data.get("push") if isinstance(data, dict) else None
         if isinstance(push, dict):
             enabled = bool(push.get("enabled"))
             target = f"{push.get('remote')}/{push.get('branch')}" if push.get("remote") and push.get("branch") else "цель неизвестна"
             self.cards["push"].set(("будет выполнен: " if enabled else "отключён: ") + target, "ok" if enabled else "warn")
-        self._recommend_from_plan(data, result)
-        self.notebook.select(0)
+        self._recommend_from_plan(data if isinstance(data, dict) else {}, result)
+        self.notebook.setCurrentIndex(0)
 
     def _format_status(self, data: dict) -> str:
         workspace = data.get("workspace", {})
         git = data.get("git", {})
         patches = data.get("patches", {})
-        lines = [
-            "== статус devctl GUI ==",
-            f"devctl: v{data.get('version')}",
-            f"Рабочая область: {workspace.get('workspaceRoot')}",
-            f"Проект: {workspace.get('projectRoot')}",
-            f"Патчи: {workspace.get('patchesDir')}",
-            f"Архивы: {workspace.get('archivesDir')}",
-            f"UTS: {workspace.get('userTestSpaceDir')} ({'есть' if workspace.get('userTestSpaceDirExists') else 'нет'})",
-            "",
-            "== конфигурация workspace ==",
-        ]
+        lines = ["== статус devctl GUI ==", f"devctl: v{data.get('version')}", f"Рабочая область: {workspace.get('workspaceRoot')}", f"Проект: {workspace.get('projectRoot')}", f"Патчи: {workspace.get('patchesDir')}", f"Архивы: {workspace.get('archivesDir')}", f"UTS: {workspace.get('userTestSpaceDir')} ({'есть' if workspace.get('userTestSpaceDirExists') else 'нет'})", "", "== конфигурация workspace =="]
         workspace_config = data.get("workspaceConfig", {}) if isinstance(data.get("workspaceConfig"), dict) else {}
-        lines.extend([
-            f"Требует обновления: {workspace_config.get('upgradeAvailable')}",
-            f"Недостающие поля: {', '.join(str(x) for x in workspace_config.get('missingFields') or []) or 'нет'}",
-            f"Недостающие исключения archive: {', '.join(str(x) for x in workspace_config.get('missingArchiveExcludes') or []) or 'нет'}",
-            f"Недостающие директории: {', '.join(str(x) for x in workspace_config.get('missingDirs') or []) or 'нет'}",
-            "",
-            "== git ==",
-            f"Доступен: {git.get('available')}",
-            f"Репозиторий: {git.get('isRepository')}",
-            f"Ветка: {git.get('branch') or 'неизвестно'}",
-            f"Рабочее дерево: {'чистое' if git.get('clean') else 'есть изменения/неизвестно'}",
-            f"Remote origin: {git.get('remoteUrl') or 'не задан'}",
-            f"Ahead/behind: {((git.get('aheadBehind') or {}).get('ahead'))}/{((git.get('aheadBehind') or {}).get('behind'))}",
-            f"Ошибка: {git.get('error') or 'нет'}",
-            "",
-            "== патчи ==",
-            f"Всего кандидатов: {patches.get('count', 0)}",
-        ])
+        lines.extend([f"Требует обновления: {workspace_config.get('upgradeAvailable')}", f"Недостающие поля: {', '.join(str(x) for x in workspace_config.get('missingFields') or []) or 'нет'}", f"Недостающие исключения archive: {', '.join(str(x) for x in workspace_config.get('missingArchiveExcludes') or []) or 'нет'}", f"Недостающие директории: {', '.join(str(x) for x in workspace_config.get('missingDirs') or []) or 'нет'}", "", "== git ==", f"Доступен: {git.get('available')}", f"Репозиторий: {git.get('isRepository')}", f"Ветка: {git.get('branch') or 'неизвестно'}", f"Рабочее дерево: {'чистое' if git.get('clean') else 'есть изменения/неизвестно'}", f"Remote origin: {git.get('remoteUrl') or 'не задан'}", f"Ahead/behind: {((git.get('aheadBehind') or {}).get('ahead'))}/{((git.get('aheadBehind') or {}).get('behind'))}", f"Ошибка: {git.get('error') or 'нет'}", "", "== патчи ==", f"Всего кандидатов: {patches.get('count', 0)}"])
         latest = patches.get("latest")
         if latest:
-            lines.extend([
-                f"Последний кандидат: {latest.get('name')}",
-                f"ID: {latest.get('patchId') or 'неизвестно'}",
-                f"Название: {latest.get('title') or 'неизвестно'}",
-                f"Статус: {latest.get('status')}",
-                f"Манифест: {latest.get('manifestError') or 'OK'}",
-            ])
+            lines.extend([f"Последний кандидат: {latest.get('name')}", f"ID: {latest.get('patchId') or 'неизвестно'}", f"Название: {latest.get('title') or 'неизвестно'}", f"Статус: {latest.get('status')}", f"Манифест: {latest.get('manifestError') or 'OK'}"])
         else:
-            if patches.get("count"):
-                lines.append("Неприменённых patch.zip не найдено; все кандидаты уже применены или видны в Git-трейлерах.")
-            else:
-                lines.append("Zip-файлы патчей не найдены.")
+            lines.append("Неприменённых patch.zip не найдено; все кандидаты уже применены или видны в Git-трейлерах." if patches.get("count") else "Zip-файлы патчей не найдены.")
         return "\n".join(lines) + "\n"
 
     def _format_plan(self, data: dict, result: RunResult) -> str:
@@ -1641,22 +1304,9 @@ class DevctlGui(tk.Tk):
         patch = data.get("patch") or {}
         manifest = data.get("manifest") or {}
         if patch:
-            lines.extend([
-                "",
-                "== патч ==",
-                f"Файл: {patch.get('name')}",
-                f"ID: {manifest.get('patchId') or patch.get('patchId') or 'неизвестно'}",
-                f"Название: {manifest.get('title') or patch.get('title') or 'неизвестно'}",
-                f"SHA-256: {patch.get('sha256') or 'неизвестно'}",
-                f"Сводка: {manifest.get('summary') or ''}",
-            ])
+            lines.extend(["", "== патч ==", f"Файл: {patch.get('name')}", f"ID: {manifest.get('patchId') or patch.get('patchId') or 'неизвестно'}", f"Название: {manifest.get('title') or patch.get('title') or 'неизвестно'}", f"SHA-256: {patch.get('sha256') or 'неизвестно'}", f"Сводка: {manifest.get('summary') or ''}"])
         apply = data.get("apply") or {}
-        lines.extend([
-            "",
-            "== применение ==",
-            f"Корень файлов: {apply.get('filesRoot') or 'files'}",
-            f"Файлов к копированию: {apply.get('copyCount', 0)}",
-        ])
+        lines.extend(["", "== применение ==", f"Корень файлов: {apply.get('filesRoot') or 'files'}", f"Файлов к копированию: {apply.get('copyCount', 0)}"])
         for name in (apply.get("copyFiles") or [])[:120]:
             lines.append(f"  + {name}")
         if len(apply.get("copyFiles") or []) > 120:
@@ -1664,8 +1314,7 @@ class DevctlGui(tk.Tk):
         lines.append(f"Путей к удалению: {apply.get('deleteCount', 0)}")
         for entry in (apply.get("deletePaths") or [])[:120]:
             lines.append(f"  - {entry.get('path')} recursive={entry.get('recursive', False)} required={entry.get('required', False)}")
-        lines.append("")
-        lines.append("== проверки ==")
+        lines.append(""); lines.append("== проверки ==")
         checks = data.get("checks") or []
         if checks:
             for check in checks:
@@ -1674,17 +1323,7 @@ class DevctlGui(tk.Tk):
             lines.append("Проверки не объявлены.")
         commit = data.get("commit") or {}
         push = data.get("push") or {}
-        lines.extend([
-            "",
-            "== commit / push ==",
-            "Политика: проверки -> commit -> push",
-            f"Сообщение коммита: {commit.get('message') or ''}",
-            f"Push включён: {push.get('enabled')}",
-            f"Цель push: {push.get('remote')}/{push.get('branch')}",
-            f"Примечание: {push.get('note') or ''}",
-            "",
-            "Файлы не изменялись. Для выполнения нажмите «Запустить конвейер»."
-        ])
+        lines.extend(["", "== commit / push ==", "Политика: проверки -> commit -> push", f"Сообщение коммита: {commit.get('message') or ''}", f"Push включён: {push.get('enabled')}", f"Цель push: {push.get('remote')}/{push.get('branch')}", f"Примечание: {push.get('note') or ''}", "", "Файлы не изменялись. Для выполнения нажмите «Запустить конвейер»."])
         return "\n".join(lines) + "\n"
 
     def start_pipeline(self, no_push: bool) -> None:
@@ -1692,45 +1331,30 @@ class DevctlGui(tk.Tk):
         plan = self.last_plan
         if not plan or not plan.get("patch"):
             self.build_plan()
-            proceed = messagebox.askyesno(
-                APP_NAME,
-                "План обновляется. Запустить конвейер после текущей проверки лучше вручную. Всё равно запустить сейчас?",
-                parent=self,
-            )
-            if not proceed:
+            if not self._confirm("План обновляется. Запустить конвейер после текущей проверки лучше вручную. Всё равно запустить сейчас?"):
                 return
         else:
             patch = plan.get("patch", {})
             push = plan.get("push", {})
             target = f"{push.get('remote')}/{push.get('branch')}" if push else "неизвестно"
-            message = [
-                f"Патч: {patch.get('title') or patch.get('name')}",
-                f"Файл: {patch.get('name')}",
-                f"Push: {'отключён вручную' if no_push else target}",
-                "",
-                "Запустить конвейер сейчас?",
-            ]
-            if not messagebox.askyesno("Подтверждение запуска", "\n".join(message), parent=self):
+            message = "\n".join([f"Патч: {patch.get('title') or patch.get('name')}", f"Файл: {patch.get('name')}", f"Push: {'отключён вручную' if no_push else target}", "", "Запустить конвейер сейчас?"])
+            if not self._confirm(message, "Подтверждение запуска"):
                 return
         self.set_running(True)
         self.set_text(self.run_text, "")
-        self.notebook.select(1)
+        self.notebook.setCurrentIndex(1)
         args = ["start", "--json"]
         if no_push:
             args.append("--no-push")
-
         def on_line(line: str) -> None:
             self.events.put(("line", line))
-
         def on_done(result: RunResult) -> None:
             self.events.put(("done", result))
-
         self.runner.stream(args, on_line, on_done)
 
     def set_running(self, running: bool) -> None:
-        state = "disabled" if running else "normal"
-        for widget in (self.main_button, self.start_btn, self.no_push_btn, self.status_btn, self.sync_btn, self.inbox_btn, self.plan_btn, self.init_btn, self.init_top_btn, self.upgrade_btn, self.reset_btn, self.report_btn, self.archives_btn, self.uts_btn, self.project_btn, self.copy_output_btn, self.copy_prompt_btn):
-            widget.configure(state=state)
+        for widget in (self.main_button, *self.action_buttons, self.init_top_btn):
+            widget.setEnabled(not running)
 
     def _on_start_done(self, result: RunResult) -> None:
         self.set_running(False)
@@ -1743,42 +1367,19 @@ class DevctlGui(tk.Tk):
             self._recommend_after_result(data, result)
         else:
             self.set_text(self.report_text, result.stdout + ("\n" + result.stderr if result.stderr else ""))
-            self._set_next_action(
-                "refresh_status",
-                "Проверить состояние после запуска",
-                "Конвейер завершился без машинно-читаемого JSON. Обновите статус и проверьте лог запуска.",
-                "Обновить статус",
-                "warn",
-            )
-        self.notebook.select(2)
+            self._set_next_action("refresh_status", "Проверить состояние после запуска", "Конвейер завершился без машинно-читаемого JSON. Обновите статус и проверьте лог запуска.", "Обновить статус", "warn")
+        self.notebook.setCurrentIndex(2)
         self.refresh_status()
         if result.returncode == 0:
-            messagebox.showinfo(APP_NAME, "Конвейер завершён успешно.")
+            QtWidgets.QMessageBox.information(self, APP_NAME, "Конвейер завершён успешно.")
         else:
-            messagebox.showerror(APP_NAME, "Конвейер завершился с ошибкой. Подробности во вкладке «Отчёт» и в логах запуска.")
+            QtWidgets.QMessageBox.critical(self, APP_NAME, "Конвейер завершился с ошибкой. Подробности во вкладке «Отчёт» и в логах запуска.")
 
     def _format_result(self, data: dict, result: RunResult) -> str:
-        lines = [
-            "== результат запуска ==",
-            f"Статус: {data.get('status')}",
-            f"Код возврата: {data.get('returncode', result.returncode)}",
-            f"Отчёт: {data.get('reportPath') or 'нет'}",
-            f"Каталог архива: {data.get('archivePath') or 'нет'}",
-            f"Коммит: {data.get('commitSha') or 'нет'}",
-            f"Push: {data.get('pushResult') or 'нет'}",
-            f"Auto-reset: {data.get('autoResetPerformed')}",
-            f"Удалённый bad patch: {data.get('badPatchDeleted') or 'нет'}",
-            f"UTS project: {data.get('utsProjectDir') or 'нет'}",
-            f"Bytecode очищено: {len(data.get('cleanedBytecodePaths') or [])}",
-            "",
-            "== предупреждения ==",
-        ]
-        warnings = data.get("warnings") or []
-        lines.extend([f"- {item}" for item in warnings] or ["нет"])
-        lines.append("")
-        lines.append("== ошибки ==")
-        errors = data.get("errors") or []
-        lines.extend([f"- {item}" for item in errors] or ["нет"])
+        lines = ["== результат запуска ==", f"Статус: {data.get('status')}", f"Код возврата: {data.get('returncode', result.returncode)}", f"Отчёт: {data.get('reportPath') or 'нет'}", f"Каталог архива: {data.get('archivePath') or 'нет'}", f"Коммит: {data.get('commitSha') or 'нет'}", f"Push: {data.get('pushResult') or 'нет'}", f"Auto-reset: {data.get('autoResetPerformed')}", f"Удалённый bad patch: {data.get('badPatchDeleted') or 'нет'}", f"UTS project: {data.get('utsProjectDir') or 'нет'}", f"Bytecode очищено: {len(data.get('cleanedBytecodePaths') or [])}", "", "== предупреждения =="]
+        lines.extend([f"- {item}" for item in data.get("warnings") or []] or ["нет"])
+        lines.append(""); lines.append("== ошибки ==")
+        lines.extend([f"- {item}" for item in data.get("errors") or []] or ["нет"])
         return "\n".join(lines) + "\n"
 
     def _drain_events(self) -> None:
@@ -1787,14 +1388,23 @@ class DevctlGui(tk.Tk):
                 kind, payload = self.events.get_nowait()
                 if kind == "result":
                     callback, result = payload  # type: ignore[misc]
-                    callback(result)
+                    self._guard(callback, result)
                 elif kind == "line":
                     self.append_run(str(payload))
                 elif kind == "done":
-                    self._on_start_done(payload)  # type: ignore[arg-type]
+                    self._guard(self._on_start_done, payload)
         except queue.Empty:
             pass
-        self.after(100, self._drain_events)
+
+    def _confirm(self, text: str, title: str = APP_NAME) -> bool:
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            title,
+            text,
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        return answer == QtWidgets.QMessageBox.StandardButton.Yes
 
     def open_report(self) -> None:
         open_path(self.last_report_path)
@@ -1826,13 +1436,31 @@ class DevctlGui(tk.Tk):
         open_path(workspace.get("projectRoot"))
 
 
+def run_gui() -> int:
+    if QT_IMPORT_ERROR is not None or QtWidgets is None:
+        print(
+            "[ОШИБКА] devctl GUI v0.4.0 требует PySide6.\n"
+            "Установите зависимость: python -m pip install PySide6\n"
+            f"Исходная ошибка: {QT_IMPORT_ERROR}",
+            file=sys.stderr,
+        )
+        return 2
+    app = QtWidgets.QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
+    icon = bundled_root() / "gui" / "assets" / "icon.ico"
+    if icon.exists() and QtGui is not None:
+        app.setWindowIcon(QtGui.QIcon(str(icon)))
+    window = DevctlGui()
+    window.show()
+    return int(app.exec())
+
+
 def main() -> int:
     configure_standard_streams()
     if len(sys.argv) > 1 and sys.argv[1] == "--devctl-child":
         return run_devctl_child(sys.argv[2:])
-    app = DevctlGui()
-    app.mainloop()
-    return 0
+    return run_gui()
 
 
 if __name__ == "__main__":
