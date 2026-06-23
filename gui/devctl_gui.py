@@ -26,7 +26,7 @@ except ImportError:  # запуск как python -m gui.devctl_gui
     from .devctl_runner import DevctlRunner, RunResult  # type: ignore
 
 APP_NAME = "devctl GUI"
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.5.1"
 BUNDLED_DEVCTL_VERSION = "0.7.0"
 
 PATCH_PROMPT_TEMPLATE = """Ты работаешь с devctl workspace и должен вернуть не полный архив проекта, а полноценный devctl-патч.
@@ -733,17 +733,27 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
             }}
             QPushButton#MagicButton:hover {{ background: {c['accent_hover']}; }}
             QToolButton#ToolIconButton {{
-                background: {c['button']};
+                background: #1b212a;
                 color: {c['text']};
-                border: 1px solid {c['border']};
-                border-radius: 11px;
+                border: 1px solid #343c49;
+                border-radius: 12px;
                 padding: 7px;
-                min-width: 34px;
-                min-height: 28px;
+                min-width: 36px;
+                min-height: 30px;
             }}
-            QToolButton#ToolIconButton:hover {{ background: {c['button_active']}; }}
-            QToolButton#ToolIconButton:pressed {{ background: #1f6feb; }}
-            QToolButton#ToolIconButton:disabled {{ color: #6e7681; background: {c['button']}; }}
+            QToolButton#ToolIconButton:hover {{
+                background: #243041;
+                border-color: #4b5f79;
+            }}
+            QToolButton#ToolIconButton:pressed {{
+                background: #1f6feb;
+                border-color: #58a6ff;
+            }}
+            QToolButton#ToolIconButton:disabled {{
+                color: #6e7681;
+                background: #161b22;
+                border-color: {c['border']};
+            }}
             QTabWidget::pane {{
                 border: 1px solid {c['border']};
                 border-radius: 12px;
@@ -795,12 +805,170 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
             }}
         """)
 
-    def _make_tool_button(self, standard_icon, tooltip: str, command: Callable) -> QtWidgets.QToolButton:
+    def _flat_icon(self, name: str) -> QtGui.QIcon:
+        """Small flat vector icons for the dark Qt toolbar.
+
+        Qt standard icons look native only in classic desktop themes. The GUI uses
+        a custom flat style, so toolbar glyphs are drawn as simple anti-aliased
+        shapes to stay readable, colourful and independent from the OS icon pack.
+        """
+        size = 28
+        pixmap = QtGui.QPixmap(size, size)
+        pixmap.fill(QtCore.Qt.GlobalColor.transparent)
+        painter = QtGui.QPainter(pixmap)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+
+        palette = {
+            "init": ("#f2cc60", "#3fb950"),
+            "status": ("#58a6ff", "#79c0ff"),
+            "settings": ("#c9d1d9", "#58a6ff"),
+            "sync": ("#58a6ff", "#3fb950"),
+            "inbox": ("#79c0ff", "#f2cc60"),
+            "plan": ("#e6edf3", "#a5d6ff"),
+            "start": ("#3fb950", "#56d364"),
+            "no_push": ("#f85149", "#ff7b72"),
+            "upgrade": ("#a371f7", "#d2a8ff"),
+            "reset": ("#58a6ff", "#79c0ff"),
+            "report": ("#e6edf3", "#8b949e"),
+            "archives": ("#f2cc60", "#d29922"),
+            "uts": ("#79c0ff", "#58a6ff"),
+            "project": ("#e6edf3", "#f2cc60"),
+            "copy": ("#a5d6ff", "#58a6ff"),
+            "prompt": ("#d2a8ff", "#f2cc60"),
+        }
+        primary, secondary = palette.get(name, ("#c9d1d9", "#58a6ff"))
+        pcolor = QtGui.QColor(primary)
+        scolor = QtGui.QColor(secondary)
+        fill = QtGui.QColor(primary)
+        fill.setAlpha(64)
+        soft = QtGui.QColor(secondary)
+        soft.setAlpha(90)
+
+        pen = QtGui.QPen(pcolor, 2.2, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap, QtCore.Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+
+        def draw_doc(x: float = 8, y: float = 5, w: float = 12, h: float = 17) -> None:
+            painter.setPen(QtGui.QPen(pcolor, 1.8, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap, QtCore.Qt.PenJoinStyle.RoundJoin))
+            painter.setBrush(fill)
+            painter.drawRoundedRect(QtCore.QRectF(x, y, w, h), 2.5, 2.5)
+            painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+            painter.drawLine(QtCore.QPointF(x + 3, y + 7), QtCore.QPointF(x + w - 3, y + 7))
+            painter.drawLine(QtCore.QPointF(x + 3, y + 11), QtCore.QPointF(x + w - 3, y + 11))
+
+        def draw_folder(x: float = 4, y: float = 8, w: float = 20, h: float = 13) -> None:
+            path = QtGui.QPainterPath()
+            path.moveTo(x, y + 4)
+            path.lineTo(x + 6, y + 4)
+            path.lineTo(x + 8, y)
+            path.lineTo(x + 14, y)
+            path.lineTo(x + 16, y + 4)
+            path.lineTo(x + w, y + 4)
+            path.lineTo(x + w, y + h)
+            path.lineTo(x, y + h)
+            path.closeSubpath()
+            painter.setBrush(fill)
+            painter.setPen(QtGui.QPen(pcolor, 1.8, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap, QtCore.Qt.PenJoinStyle.RoundJoin))
+            painter.drawPath(path)
+            painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+
+        def arrow_head(points: list[tuple[float, float]], color: QtGui.QColor | None = None) -> None:
+            painter.setPen(QtCore.Qt.PenStyle.NoPen)
+            painter.setBrush(color or pcolor)
+            painter.drawPolygon(QtGui.QPolygonF([QtCore.QPointF(x, y) for x, y in points]))
+            painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+            painter.setPen(pen)
+
+        if name == "init":
+            draw_folder()
+            painter.setPen(QtGui.QPen(scolor, 2.4, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap))
+            painter.drawLine(QtCore.QPointF(19, 10), QtCore.QPointF(19, 18))
+            painter.drawLine(QtCore.QPointF(15, 14), QtCore.QPointF(23, 14))
+        elif name in {"status", "reset"}:
+            painter.setPen(QtGui.QPen(pcolor, 2.2, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap))
+            painter.drawArc(QtCore.QRectF(6, 6, 16, 16), 35 * 16, 280 * 16)
+            arrow_head([(20, 6), (23, 10), (18, 10)], scolor)
+            if name == "reset":
+                painter.setPen(QtGui.QPen(scolor, 2.0, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap))
+                painter.drawLine(QtCore.QPointF(10, 9), QtCore.QPointF(7, 12))
+        elif name == "settings":
+            painter.setPen(QtGui.QPen(pcolor, 2.0, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap))
+            for y, knob_x in ((8, 12), (14, 18), (20, 9)):
+                painter.drawLine(QtCore.QPointF(6, y), QtCore.QPointF(22, y))
+                painter.setBrush(scolor)
+                painter.drawEllipse(QtCore.QPointF(knob_x, y), 2.4, 2.4)
+                painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+        elif name == "sync":
+            painter.setPen(QtGui.QPen(pcolor, 2.2, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap))
+            painter.drawLine(QtCore.QPointF(7, 10), QtCore.QPointF(20, 10))
+            arrow_head([(20, 6.5), (24, 10), (20, 13.5)], pcolor)
+            painter.setPen(QtGui.QPen(scolor, 2.2, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap))
+            painter.drawLine(QtCore.QPointF(21, 18), QtCore.QPointF(8, 18))
+            arrow_head([(8, 14.5), (4, 18), (8, 21.5)], scolor)
+        elif name == "inbox":
+            painter.setPen(QtGui.QPen(pcolor, 2.0, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap))
+            painter.setBrush(fill)
+            painter.drawRoundedRect(QtCore.QRectF(5, 16, 18, 7), 2.5, 2.5)
+            painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+            painter.drawLine(QtCore.QPointF(14, 5), QtCore.QPointF(14, 15))
+            arrow_head([(10, 12), (14, 17), (18, 12)], scolor)
+        elif name in {"plan", "report"}:
+            draw_doc()
+            if name == "plan":
+                painter.setPen(QtGui.QPen(scolor, 2.2, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap))
+                painter.drawEllipse(QtCore.QPointF(18.5, 18.5), 2.2, 2.2)
+        elif name == "start":
+            painter.setPen(QtCore.Qt.PenStyle.NoPen)
+            painter.setBrush(scolor)
+            painter.drawPolygon(QtGui.QPolygonF([QtCore.QPointF(10, 7), QtCore.QPointF(21, 14), QtCore.QPointF(10, 21)]))
+        elif name == "no_push":
+            painter.setPen(QtGui.QPen(pcolor, 2.5, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap))
+            painter.drawLine(QtCore.QPointF(9, 9), QtCore.QPointF(19, 19))
+            painter.drawLine(QtCore.QPointF(19, 9), QtCore.QPointF(9, 19))
+        elif name == "upgrade":
+            painter.setPen(QtGui.QPen(pcolor, 2.4, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap))
+            painter.drawLine(QtCore.QPointF(14, 21), QtCore.QPointF(14, 8))
+            arrow_head([(9, 11), (14, 5), (19, 11)], scolor)
+        elif name == "archives":
+            draw_folder()
+        elif name == "uts":
+            painter.setPen(QtGui.QPen(pcolor, 1.9, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap, QtCore.Qt.PenJoinStyle.RoundJoin))
+            painter.setBrush(fill)
+            painter.drawRoundedRect(QtCore.QRectF(5, 6, 18, 13), 2.5, 2.5)
+            painter.setBrush(scolor)
+            painter.drawRoundedRect(QtCore.QRectF(10, 21, 8, 2), 1, 1)
+        elif name == "project":
+            painter.setPen(QtGui.QPen(pcolor, 2.0, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap, QtCore.Qt.PenJoinStyle.RoundJoin))
+            painter.setBrush(fill)
+            painter.drawPolygon(QtGui.QPolygonF([QtCore.QPointF(6, 13), QtCore.QPointF(14, 6), QtCore.QPointF(22, 13), QtCore.QPointF(22, 22), QtCore.QPointF(8, 22), QtCore.QPointF(8, 13)]))
+            painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+        elif name == "copy":
+            painter.setPen(QtGui.QPen(pcolor, 1.8, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap, QtCore.Qt.PenJoinStyle.RoundJoin))
+            painter.setBrush(soft)
+            painter.drawRoundedRect(QtCore.QRectF(7, 7, 10, 12), 2, 2)
+            painter.setBrush(fill)
+            painter.drawRoundedRect(QtCore.QRectF(11, 10, 10, 12), 2, 2)
+        elif name == "prompt":
+            painter.setPen(QtGui.QPen(pcolor, 2.2, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap))
+            painter.drawLine(QtCore.QPointF(8, 20), QtCore.QPointF(20, 8))
+            painter.setPen(QtGui.QPen(scolor, 1.7, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap))
+            painter.drawLine(QtCore.QPointF(8, 7), QtCore.QPointF(8, 12))
+            painter.drawLine(QtCore.QPointF(5.5, 9.5), QtCore.QPointF(10.5, 9.5))
+            painter.drawLine(QtCore.QPointF(21, 17), QtCore.QPointF(21, 22))
+            painter.drawLine(QtCore.QPointF(18.5, 19.5), QtCore.QPointF(23.5, 19.5))
+        else:
+            painter.setBrush(fill)
+            painter.drawEllipse(QtCore.QPointF(14, 14), 7, 7)
+
+        painter.end()
+        return QtGui.QIcon(pixmap)
+
+    def _make_tool_button(self, icon_name: str, tooltip: str, command: Callable) -> QtWidgets.QToolButton:
         button = QtWidgets.QToolButton()
         button.setObjectName("ToolIconButton")
         button.setAutoRaise(False)
-        button.setIcon(self.style().standardIcon(standard_icon))
-        button.setIconSize(QtCore.QSize(18, 18))
+        button.setIcon(self._flat_icon(icon_name))
+        button.setIconSize(QtCore.QSize(22, 22))
         button.setToolTip(tooltip)
         button.setAccessibleName(tooltip)
         button.clicked.connect(lambda _checked=False, cmd=command: self._guard(cmd))
@@ -880,23 +1048,22 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
 
         actions = QtWidgets.QHBoxLayout()
         actions.setSpacing(6)
-        sp = QtWidgets.QStyle.StandardPixmap
-        self.init_btn = self._make_tool_button(sp.SP_FileDialogNewFolder, "Инициализировать workspace", self.init_workspace)
-        self.status_btn = self._make_tool_button(sp.SP_BrowserReload, "Показать статус", self.refresh_status)
-        self.settings_btn = self._make_tool_button(sp.SP_FileDialogDetailedView, "Настройки Patch Inbox и регистрации workspace", self.configure_patch_inbox)
-        self.sync_btn = self._make_tool_button(sp.SP_BrowserReload, "Синхронизировать workspace с GitHub: project -> archives -> UTS", self.sync_workspace)
-        self.inbox_btn = self._make_tool_button(sp.SP_ArrowDown, "Забрать patch.zip из Patch Inbox", self.grab_inbox_patch)
-        self.plan_btn = self._make_tool_button(sp.SP_FileDialogContentsView, "Построить dry-run план", self.build_plan)
-        self.start_btn = self._make_tool_button(sp.SP_MediaPlay, "Запустить конвейер с push по плану", lambda: self.start_pipeline(False))
-        self.no_push_btn = self._make_tool_button(sp.SP_DialogCancelButton, "Запустить конвейер без push", lambda: self.start_pipeline(True))
-        self.upgrade_btn = self._make_tool_button(sp.SP_ArrowUp, "Безопасно обновить структуру workspace", self.upgrade_workspace)
-        self.reset_btn = self._make_tool_button(sp.SP_BrowserReload, "Reset project: git reset --hard + git clean", self.reset_project)
-        self.report_btn = self._make_tool_button(sp.SP_FileIcon, "Открыть последний отчёт", self.open_report)
-        self.archives_btn = self._make_tool_button(sp.SP_DirIcon, "Открыть archives/", self.open_archives)
-        self.uts_btn = self._make_tool_button(sp.SP_DriveHDIcon, "Открыть UserTestSpace/ или свежую UTS-копию", self.open_uts)
-        self.project_btn = self._make_tool_button(sp.SP_DirHomeIcon, "Открыть project/", self.open_project)
-        self.copy_output_btn = self._make_tool_button(sp.SP_FileDialogListView, "Скопировать текущий вывод активной вкладки", self.copy_current_output)
-        self.copy_prompt_btn = self._make_tool_button(sp.SP_FileDialogInfoView, "Скопировать prompt-патча", self.copy_patch_prompt)
+        self.init_btn = self._make_tool_button("init", "Инициализировать workspace", self.init_workspace)
+        self.status_btn = self._make_tool_button("status", "Показать статус", self.refresh_status)
+        self.settings_btn = self._make_tool_button("settings", "Настройки Patch Inbox и регистрации workspace", self.configure_patch_inbox)
+        self.sync_btn = self._make_tool_button("sync", "Синхронизировать workspace с GitHub: project -> archives -> UTS", self.sync_workspace)
+        self.inbox_btn = self._make_tool_button("inbox", "Забрать patch.zip из Patch Inbox", self.grab_inbox_patch)
+        self.plan_btn = self._make_tool_button("plan", "Построить dry-run план", self.build_plan)
+        self.start_btn = self._make_tool_button("start", "Запустить конвейер с push по плану", lambda: self.start_pipeline(False))
+        self.no_push_btn = self._make_tool_button("no_push", "Запустить конвейер без push", lambda: self.start_pipeline(True))
+        self.upgrade_btn = self._make_tool_button("upgrade", "Безопасно обновить структуру workspace", self.upgrade_workspace)
+        self.reset_btn = self._make_tool_button("reset", "Reset project: git reset --hard + git clean", self.reset_project)
+        self.report_btn = self._make_tool_button("report", "Открыть последний отчёт", self.open_report)
+        self.archives_btn = self._make_tool_button("archives", "Открыть archives/", self.open_archives)
+        self.uts_btn = self._make_tool_button("uts", "Открыть UserTestSpace/ или свежую UTS-копию", self.open_uts)
+        self.project_btn = self._make_tool_button("project", "Открыть project/", self.open_project)
+        self.copy_output_btn = self._make_tool_button("copy", "Скопировать текущий вывод активной вкладки", self.copy_current_output)
+        self.copy_prompt_btn = self._make_tool_button("prompt", "Скопировать prompt-патча", self.copy_patch_prompt)
         self.action_buttons = (
             self.init_btn, self.status_btn, self.settings_btn, self.sync_btn, self.inbox_btn, self.plan_btn,
             self.start_btn, self.no_push_btn, self.upgrade_btn, self.reset_btn, self.report_btn,
@@ -972,6 +1139,31 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
         missing.extend(workspace_config.get("missingDirs") or [])
         return ", ".join(str(item) for item in missing[:8]) or "структура workspace устарела"
 
+    @staticmethod
+    def _workspace_needs_structural_upgrade(workspace_config: dict) -> bool:
+        """Return True only when the workspace is missing real infrastructure.
+
+        `devctl status` may also report optional archive exclude hints. Those are
+        useful maintenance details, but they should not become the yellow primary
+        recommendation when project/, patches/, archives/ and UserTestSpace/ are
+        already present and there are simply no new patches to run.
+        """
+        if not workspace_config.get("upgradeAvailable"):
+            return False
+        missing_fields = [str(item) for item in (workspace_config.get("missingFields") or [])]
+        missing_dirs = [str(item) for item in (workspace_config.get("missingDirs") or [])]
+        if workspace_config.get("error"):
+            return True
+        return bool(missing_fields or missing_dirs)
+
+    @staticmethod
+    def _format_idle_workspace_details(workspace_config: dict) -> str:
+        optional_excludes = [str(item) for item in (workspace_config.get("missingArchiveExcludes") or [])]
+        details = "Структура workspace готова, Git чистый, неприменённых patch.zip нет. Можно положить новый архив в Patch Inbox/incoming/ и нажать «Забрать патч из склада» либо просто оставить workspace как есть."
+        if optional_excludes:
+            details += " Есть только необязательные подсказки по archive.exclude: " + ", ".join(optional_excludes[:6]) + ". Они не означают, что workspace сломан."
+        return details
+
     def _recommend_from_status(self, data: dict) -> None:
         workspace = data.get("workspace", {}) if isinstance(data.get("workspace"), dict) else {}
         git = data.get("git", {}) if isinstance(data.get("git"), dict) else {}
@@ -980,6 +1172,7 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
         project_root = workspace.get("projectRoot") or "project/"
         workspace_config = data.get("workspaceConfig", {}) if isinstance(data.get("workspaceConfig"), dict) else {}
         upgrade_available = bool(workspace.get("projectExists") and workspace_config.get("upgradeAvailable"))
+        structural_upgrade_needed = bool(workspace.get("projectExists") and self._workspace_needs_structural_upgrade(workspace_config))
         upgrade_details = self._workspace_upgrade_details(workspace_config)
         if not workspace.get("projectExists"):
             self._set_next_action("init_workspace", "Создать или выбрать рабочую область devctl", f"В текущем workspace не найден project/: {project_root}. Можно создать новый workspace мастером или выбрать уже существующий.", "Инициализировать workspace", "warn")
@@ -994,19 +1187,19 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
             self._set_next_action("reset_project", "Рабочее дерево project/ загрязнено", "Можно открыть git status для ручной проверки или нажать reset: GUI вызовет devctl reset после отдельного предупреждения и откатит project/ через git reset --hard + git clean -fd.", "Reset project", "warn")
             return
         if not latest:
-            if self.last_report_path:
-                self._set_next_action("open_report", "Посмотреть отчёт последнего запуска", "Неприменённых патчей сейчас нет. Можно открыть последний отчёт или добавить новый patch.zip в папку patches/.", "Открыть последний отчёт", "ok")
-            elif upgrade_available:
+            if structural_upgrade_needed:
                 self._set_next_action("upgrade_workspace", "Безопасно обновить структуру workspace", f"devctl видит, что workspace можно актуализировать: {upgrade_details}. Команда init --upgrade не трогает project/ и пользовательские пути, а только добавляет недостающую инфраструктуру.", "Обновить структуру workspace", "warn")
+            elif self.last_report_path:
+                self._set_next_action("open_report", "Workspace готов, новых патчей нет", "Неприменённых patch.zip сейчас нет. Можно открыть последний отчёт или положить новый архив в Patch Inbox/incoming/.", "Открыть последний отчёт", "ok")
             else:
-                self._set_next_action("grab_inbox_patch", "Забрать новый patch.zip из Patch Inbox", "Неприменённых патчей в patches/ нет. Если patch.zip уже лежит в общем складе, GUI вызовет `devctl inbox grab --json`: ядро само определит workspace, скопирует архив в patches/ и не будет применять его автоматически.", "Забрать патч из склада", "ok")
+                self._set_next_action("grab_inbox_patch", "Workspace готов, новых патчей нет", self._format_idle_workspace_details(workspace_config), "Забрать патч из склада", "ok")
             return
         if latest.get("manifestError"):
             self._set_next_action("build_plan", "Посмотреть ошибку патча", f"Найден patch.zip, но его манифест некорректен: {latest.get('manifestError')}. Постройте план, чтобы увидеть детали валидации.", "Показать ошибку патча", "bad")
             return
         title = latest.get("title") or latest.get("name") or "следующий патч"
         upgrade_note = ""
-        if upgrade_available:
+        if structural_upgrade_needed:
             upgrade_note = f" Дополнительно devctl предлагает обновить структуру workspace: {upgrade_details}. Это не блокирует построение плана и запуск патча."
         self._set_next_action("build_plan", "Построить прозрачный план запуска", f"Workspace выглядит готовым. Следующий патч: {title}. Перед запуском лучше посмотреть dry-run план: файлы, проверки, commit и push.{upgrade_note}", "Построить план", "ok")
 
@@ -1492,7 +1685,7 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
             self.cards["patch"].set(latest.get("title") or latest.get("name") or "найден", "bad" if latest.get("manifestError") else "ok")
         else:
             patches = data.get("patches", {}) if isinstance(data.get("patches"), dict) else {}
-            self.cards["patch"].set("нет новых" if patches.get("count") else "нет патчей", "ok" if patches.get("count") else "warn")
+            self.cards["patch"].set("нет новых" if patches.get("count") else "нет патчей", "ok")
         self.cards["uts"].set("готов" if workspace.get("userTestSpaceDirExists") else "нужно обновить", "ok" if workspace.get("userTestSpaceDirExists") else "warn")
         self.cards["push"].set("см. план" if latest else "неизвестно", "neutral")
         self._recommend_from_status(data)
@@ -1673,7 +1866,7 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
 def run_gui() -> int:
     if QT_IMPORT_ERROR is not None or QtWidgets is None:
         print(
-            "[ОШИБКА] devctl GUI v0.5.0 требует PySide6.\n"
+            "[ОШИБКА] devctl GUI v0.5.1 требует PySide6.\n"
             "Установите зависимость: python -m pip install PySide6\n"
             f"Исходная ошибка: {QT_IMPORT_ERROR}",
             file=sys.stderr,
