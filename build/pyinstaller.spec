@@ -12,6 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PyInstaller.config import CONF
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
 
 spec_dir = Path(SPECPATH).resolve()
 if not spec_dir.is_dir():
@@ -39,9 +40,9 @@ if icon_file.exists():
 a = Analysis(
     [str(project_root / "gui" / "devctl_gui.py")],
     pathex=[str(project_root), str(project_root / "gui")],
-    binaries=[],
-    datas=datas,
-    hiddenimports=["devctl", "devctl_runner", "PySide6.QtCore", "PySide6.QtGui", "PySide6.QtWidgets"],
+    binaries=collect_dynamic_libs("PySide6"),
+    datas=datas + collect_data_files("PySide6"),
+    hiddenimports=["devctl", "devctl_runner", *collect_submodules("PySide6")],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -61,8 +62,8 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    upx_exclude=[],
+    upx=False,
+    upx_exclude=["Qt6*.dll", "PySide6*.pyd"],
     runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,

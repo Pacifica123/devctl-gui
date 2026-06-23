@@ -106,3 +106,7 @@ Windows `.exe` не собран в этой Linux-среде, потому чт
 ## GUI v0.4.0 Qt migration
 
 GUI-представление перенесено на Qt/PySide6 с сохранением child-mode, subprocess-runner и сценариев devctl. Интерфейс получил flat dark stylesheet с округлёнными карточками, кнопками, полями ввода и вкладками.
+
+## GUI v0.5.0 polish + Patch Inbox settings
+
+Добавлены настройки Patch Inbox в GUI: пользователь может выбрать глобальный склад patch.zip и зарегистрировать текущий workspace без ручного `devctl inbox init` / `devctl workspace register`. Визуальная тема доработана: QLabel сделаны прозрачными внутри карточек, а панель действий переведена на нативные стандартные Qt-иконки. Сборка Windows EXE усилена установкой PySide6, явным сбором PySide6 в spec и child-mode smoke-test.

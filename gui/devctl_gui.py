@@ -26,7 +26,7 @@ except ImportError:  # запуск как python -m gui.devctl_gui
     from .devctl_runner import DevctlRunner, RunResult  # type: ignore
 
 APP_NAME = "devctl GUI"
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 BUNDLED_DEVCTL_VERSION = "0.7.0"
 
 PATCH_PROMPT_TEMPLATE = """Ты работаешь с devctl workspace и должен вернуть не полный архив проекта, а полноценный devctl-патч.
@@ -464,6 +464,135 @@ class WorkspaceChoiceDialog(QtWidgets.QDialog if QtWidgets else object):
         self.accept()
 
 
+
+class PatchInboxSettingsDialog(QtWidgets.QDialog if QtWidgets else object):
+    """Настройки глобального Patch Inbox и регистрации текущего workspace."""
+
+    def __init__(self, parent, *, workspace_path: Path, scan_data: dict) -> None:
+        if QtWidgets is None:
+            raise RuntimeError("PySide6 не импортирован")
+        super().__init__(parent)
+        self.setWindowTitle("Настройки Patch Inbox")
+        self.setModal(True)
+        self.resize(760, 430)
+        self.workspace_path = workspace_path
+        self.scan_data = scan_data if isinstance(scan_data, dict) else {}
+        self.result: dict[str, object] | None = None
+
+        body = QtWidgets.QVBoxLayout(self)
+        body.setContentsMargins(20, 20, 20, 20)
+        body.setSpacing(12)
+
+        title = QtWidgets.QLabel("Patch Inbox и workspace registry")
+        title.setObjectName("DialogTitle")
+        body.addWidget(title)
+        intro = QtWidgets.QLabel(
+            "Здесь можно явно указать общий склад patch.zip и сразу зарегистрировать текущий workspace, "
+            "чтобы кнопка «Забрать патч» работала без ручных команд в терминале."
+        )
+        intro.setWordWrap(True)
+        body.addWidget(intro)
+
+        config_path = self.scan_data.get("configPath") or "будет создан автоматически"
+        config_label = QtWidgets.QLabel(f"Глобальный config: {config_path}")
+        config_label.setObjectName("MutedLabel")
+        config_label.setWordWrap(True)
+        body.addWidget(config_label)
+
+        inbox_group = QtWidgets.QGroupBox("Склад патчей")
+        inbox_layout = QtWidgets.QVBoxLayout(inbox_group)
+        inbox_layout.setSpacing(8)
+        dirs = [str(item) for item in (self.scan_data.get("patchInboxDirs") or []) if str(item).strip()]
+        initial_inbox = dirs[0] if dirs else str((Path.home() / "PatchInbox").resolve())
+        inbox_row = QtWidgets.QHBoxLayout()
+        self.inbox_edit = QtWidgets.QLineEdit(initial_inbox)
+        choose_inbox = QtWidgets.QPushButton("Выбрать...")
+        choose_inbox.clicked.connect(self.choose_inbox)
+        inbox_row.addWidget(self.inbox_edit, 1)
+        inbox_row.addWidget(choose_inbox)
+        inbox_layout.addLayout(inbox_row)
+        dirs_note = QtWidgets.QLabel("Текущие склады: " + ("; ".join(dirs) if dirs else "не настроены"))
+        dirs_note.setObjectName("MutedLabel")
+        dirs_note.setWordWrap(True)
+        inbox_layout.addWidget(dirs_note)
+        body.addWidget(inbox_group)
+
+        workspace_group = QtWidgets.QGroupBox("Регистрация текущего workspace")
+        workspace_layout = QtWidgets.QFormLayout(workspace_group)
+        workspace_layout.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+        registered_record = self._registered_workspace_record()
+        self.register_check = QtWidgets.QCheckBox("Зарегистрировать или обновить текущий workspace в глобальном config")
+        self.register_check.setChecked(registered_record is None)
+        workspace_layout.addRow(self.register_check)
+        self.workspace_path_label = QtWidgets.QLabel(str(workspace_path))
+        self.workspace_path_label.setWordWrap(True)
+        workspace_layout.addRow("Workspace:", self.workspace_path_label)
+        default_id = str((registered_record or {}).get("id") or self._suggest_workspace_id(workspace_path))
+        default_name = str((registered_record or {}).get("name") or workspace_path.name or default_id)
+        self.workspace_id_edit = QtWidgets.QLineEdit(default_id)
+        self.workspace_id_edit.setMaximumWidth(220)
+        self.workspace_name_edit = QtWidgets.QLineEdit(default_name)
+        workspace_layout.addRow("ID:", self.workspace_id_edit)
+        workspace_layout.addRow("Name:", self.workspace_name_edit)
+        body.addWidget(workspace_group)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel | QtWidgets.QDialogButtonBox.StandardButton.Ok
+        )
+        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).setText("Сохранить настройки")
+        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
+        buttons.accepted.connect(self.accept_request)
+        buttons.rejected.connect(self.reject)
+        body.addWidget(buttons)
+
+    def choose_inbox(self) -> None:
+        selected = QtWidgets.QFileDialog.getExistingDirectory(self, "Выберите папку Patch Inbox")
+        if selected:
+            self.inbox_edit.setText(selected)
+
+    def _registered_workspace_record(self) -> dict | None:
+        current = str(self.workspace_path.resolve())
+        for record in self.scan_data.get("workspaces") or []:
+            if not isinstance(record, dict):
+                continue
+            raw = record.get("path")
+            if not raw:
+                continue
+            try:
+                candidate = str(Path(str(raw)).expanduser().resolve())
+            except Exception:
+                candidate = str(raw)
+            if os.path.normcase(candidate) == os.path.normcase(current):
+                return record
+        return None
+
+    @staticmethod
+    def _suggest_workspace_id(path: Path) -> str:
+        raw = path.name or "workspace"
+        value = "".join(ch.lower() if ch.isalnum() else "-" for ch in raw).strip("-")
+        while "--" in value:
+            value = value.replace("--", "-")
+        return value or "workspace"
+
+    def accept_request(self) -> None:
+        inbox_path = self.inbox_edit.text().strip()
+        if not inbox_path:
+            QtWidgets.QMessageBox.critical(self, APP_NAME, "Укажите путь до склада Patch Inbox.")
+            return
+        workspace_id = self.workspace_id_edit.text().strip()
+        workspace_name = self.workspace_name_edit.text().strip()
+        if self.register_check.isChecked() and not workspace_id:
+            QtWidgets.QMessageBox.critical(self, APP_NAME, "Укажите короткий ID workspace для регистрации.")
+            return
+        self.result = {
+            "inboxPath": inbox_path,
+            "registerWorkspace": self.register_check.isChecked(),
+            "workspaceId": workspace_id,
+            "workspaceName": workspace_name,
+        }
+        self.accept()
+
+
 class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
     def __init__(self) -> None:
         if QtWidgets is None or QtCore is None or QtGui is None:
@@ -528,10 +657,15 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
         c = self.colors
         self.setStyleSheet(f"""
             QMainWindow, QWidget {{
-                background: {c['bg']};
                 color: {c['text']};
                 font-family: 'Segoe UI', 'Inter', Arial, sans-serif;
                 font-size: 10pt;
+            }}
+            QMainWindow, QWidget#AppRoot, QDialog {{
+                background: {c['bg']};
+            }}
+            QLabel, QCheckBox, QRadioButton {{
+                background: transparent;
             }}
             QLabel#HeaderLabel {{
                 color: #f0f6fc;
@@ -598,14 +732,18 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
                 font-weight: 700;
             }}
             QPushButton#MagicButton:hover {{ background: {c['accent_hover']}; }}
-            QPushButton#IconButton {{
-                font-family: 'Segoe UI Symbol', 'Segoe UI', sans-serif;
-                font-size: 13pt;
-                font-weight: 700;
-                min-width: 32px;
-                padding: 6px 8px;
-                border-radius: 10px;
+            QToolButton#ToolIconButton {{
+                background: {c['button']};
+                color: {c['text']};
+                border: 1px solid {c['border']};
+                border-radius: 11px;
+                padding: 7px;
+                min-width: 34px;
+                min-height: 28px;
             }}
+            QToolButton#ToolIconButton:hover {{ background: {c['button_active']}; }}
+            QToolButton#ToolIconButton:pressed {{ background: #1f6feb; }}
+            QToolButton#ToolIconButton:disabled {{ color: #6e7681; background: {c['button']}; }}
             QTabWidget::pane {{
                 border: 1px solid {c['border']};
                 border-radius: 12px;
@@ -657,15 +795,20 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
             }}
         """)
 
-    def _make_icon_button(self, icon: str, tooltip: str, command: Callable) -> QtWidgets.QPushButton:
-        button = QtWidgets.QPushButton(icon)
-        button.setObjectName("IconButton")
+    def _make_tool_button(self, standard_icon, tooltip: str, command: Callable) -> QtWidgets.QToolButton:
+        button = QtWidgets.QToolButton()
+        button.setObjectName("ToolIconButton")
+        button.setAutoRaise(False)
+        button.setIcon(self.style().standardIcon(standard_icon))
+        button.setIconSize(QtCore.QSize(18, 18))
         button.setToolTip(tooltip)
+        button.setAccessibleName(tooltip)
         button.clicked.connect(lambda _checked=False, cmd=command: self._guard(cmd))
         return button
 
     def _build_ui(self, default_workspace: str) -> None:
         root = QtWidgets.QWidget()
+        root.setObjectName("AppRoot")
         self.setCentralWidget(root)
         main = QtWidgets.QVBoxLayout(root)
         main.setContentsMargins(16, 16, 16, 16)
@@ -688,10 +831,13 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
         choose_btn.clicked.connect(lambda: self._guard(self.choose_workspace))
         self.init_top_btn = QtWidgets.QPushButton("Новый workspace")
         self.init_top_btn.clicked.connect(lambda: self._guard(self.init_workspace))
+        self.settings_top_btn = QtWidgets.QPushButton("Настройки")
+        self.settings_top_btn.clicked.connect(lambda: self._guard(self.configure_patch_inbox))
         refresh_btn = QtWidgets.QPushButton("Обновить")
         refresh_btn.clicked.connect(lambda: self._guard(self.refresh_status))
         path_row.addWidget(choose_btn)
         path_row.addWidget(self.init_top_btn)
+        path_row.addWidget(self.settings_top_btn)
         path_row.addWidget(refresh_btn)
         main.addLayout(path_row)
 
@@ -734,23 +880,25 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
 
         actions = QtWidgets.QHBoxLayout()
         actions.setSpacing(6)
-        self.init_btn = self._make_icon_button("＋", "Инициализировать workspace", self.init_workspace)
-        self.status_btn = self._make_icon_button("●", "Показать статус", self.refresh_status)
-        self.sync_btn = self._make_icon_button("⇄", "Синхронизировать workspace с GitHub: project -> archives -> UTS", self.sync_workspace)
-        self.inbox_btn = self._make_icon_button("⇩", "Забрать patch.zip из Patch Inbox", self.grab_inbox_patch)
-        self.plan_btn = self._make_icon_button("☷", "Построить dry-run план", self.build_plan)
-        self.start_btn = self._make_icon_button("▶", "Запустить конвейер с push по плану", lambda: self.start_pipeline(False))
-        self.no_push_btn = self._make_icon_button("⊘", "Запустить конвейер без push", lambda: self.start_pipeline(True))
-        self.upgrade_btn = self._make_icon_button("⇧", "Безопасно обновить структуру workspace", self.upgrade_workspace)
-        self.reset_btn = self._make_icon_button("↺", "Reset project: git reset --hard + git clean", self.reset_project)
-        self.report_btn = self._make_icon_button("☰", "Открыть последний отчёт", self.open_report)
-        self.archives_btn = self._make_icon_button("▤", "Открыть archives/", self.open_archives)
-        self.uts_btn = self._make_icon_button("◇", "Открыть UserTestSpace/ или свежую UTS-копию", self.open_uts)
-        self.project_btn = self._make_icon_button("⌂", "Открыть project/", self.open_project)
-        self.copy_output_btn = self._make_icon_button("⧉", "Скопировать текущий вывод активной вкладки", self.copy_current_output)
-        self.copy_prompt_btn = self._make_icon_button("✎", "Скопировать prompt-патча", self.copy_patch_prompt)
+        sp = QtWidgets.QStyle.StandardPixmap
+        self.init_btn = self._make_tool_button(sp.SP_FileDialogNewFolder, "Инициализировать workspace", self.init_workspace)
+        self.status_btn = self._make_tool_button(sp.SP_BrowserReload, "Показать статус", self.refresh_status)
+        self.settings_btn = self._make_tool_button(sp.SP_FileDialogDetailedView, "Настройки Patch Inbox и регистрации workspace", self.configure_patch_inbox)
+        self.sync_btn = self._make_tool_button(sp.SP_BrowserReload, "Синхронизировать workspace с GitHub: project -> archives -> UTS", self.sync_workspace)
+        self.inbox_btn = self._make_tool_button(sp.SP_ArrowDown, "Забрать patch.zip из Patch Inbox", self.grab_inbox_patch)
+        self.plan_btn = self._make_tool_button(sp.SP_FileDialogContentsView, "Построить dry-run план", self.build_plan)
+        self.start_btn = self._make_tool_button(sp.SP_MediaPlay, "Запустить конвейер с push по плану", lambda: self.start_pipeline(False))
+        self.no_push_btn = self._make_tool_button(sp.SP_DialogCancelButton, "Запустить конвейер без push", lambda: self.start_pipeline(True))
+        self.upgrade_btn = self._make_tool_button(sp.SP_ArrowUp, "Безопасно обновить структуру workspace", self.upgrade_workspace)
+        self.reset_btn = self._make_tool_button(sp.SP_BrowserReload, "Reset project: git reset --hard + git clean", self.reset_project)
+        self.report_btn = self._make_tool_button(sp.SP_FileIcon, "Открыть последний отчёт", self.open_report)
+        self.archives_btn = self._make_tool_button(sp.SP_DirIcon, "Открыть archives/", self.open_archives)
+        self.uts_btn = self._make_tool_button(sp.SP_DriveHDIcon, "Открыть UserTestSpace/ или свежую UTS-копию", self.open_uts)
+        self.project_btn = self._make_tool_button(sp.SP_DirHomeIcon, "Открыть project/", self.open_project)
+        self.copy_output_btn = self._make_tool_button(sp.SP_FileDialogListView, "Скопировать текущий вывод активной вкладки", self.copy_current_output)
+        self.copy_prompt_btn = self._make_tool_button(sp.SP_FileDialogInfoView, "Скопировать prompt-патча", self.copy_patch_prompt)
         self.action_buttons = (
-            self.init_btn, self.status_btn, self.sync_btn, self.inbox_btn, self.plan_btn,
+            self.init_btn, self.status_btn, self.settings_btn, self.sync_btn, self.inbox_btn, self.plan_btn,
             self.start_btn, self.no_push_btn, self.upgrade_btn, self.reset_btn, self.report_btn,
             self.archives_btn, self.uts_btn, self.project_btn, self.copy_output_btn, self.copy_prompt_btn,
         )
@@ -802,6 +950,7 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
             "refresh_status": self.refresh_status,
             "sync_workspace": self.sync_workspace,
             "grab_inbox_patch": self.grab_inbox_patch,
+            "configure_patch_inbox": self.configure_patch_inbox,
             "open_patches": self.open_patches,
             "open_project": self.open_project,
             "show_git_status": self.show_git_status,
@@ -927,6 +1076,91 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
         self.set_text(self.report_text, "== prompt-шаблон devctl-патча ==\n\nШаблон скопирован в буфер обмена. Его можно вставить в новую ChatGPT-сессию, чтобы попросить собрать корректный devctl-патч для этого workspace.\n\n" + text)
         self.notebook.setCurrentIndex(2)
         QtWidgets.QMessageBox.information(self, APP_NAME, "Prompt-шаблон для devctl-патча скопирован в буфер обмена.")
+
+    def configure_patch_inbox(self) -> None:
+        self._save_workspace()
+        self.set_running(True)
+        self.set_text(self.report_text, "Загружаю настройки Patch Inbox...\n")
+        self.notebook.setCurrentIndex(2)
+        self._run_async(["inbox", "scan", "--json"], self._on_patch_inbox_settings_scan, timeout=120)
+
+    def _on_patch_inbox_settings_scan(self, result: RunResult) -> None:
+        self.set_running(False)
+        data = result.json_data if isinstance(result.json_data, dict) else {}
+        workspace = Path(self.path_entry.text()).expanduser().resolve()
+        dialog = PatchInboxSettingsDialog(self, workspace_path=workspace, scan_data=data)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted or not dialog.result:
+            self.set_text(self.report_text, self._format_inbox_scan_result(data, result) if data else (result.stdout or "Настройка отменена.\n"))
+            return
+        self._apply_patch_inbox_settings(dialog.result)
+
+    def _apply_patch_inbox_settings(self, settings: dict[str, object]) -> None:
+        inbox_path = str(settings.get("inboxPath") or "").strip()
+        commands: list[list[str]] = []
+        if inbox_path:
+            commands.append(["inbox", "init", "--path", inbox_path, "--json"])
+        if bool(settings.get("registerWorkspace")):
+            register_cmd = ["workspace", "register", ".", "--json"]
+            workspace_id = str(settings.get("workspaceId") or "").strip()
+            workspace_name = str(settings.get("workspaceName") or "").strip()
+            if workspace_id:
+                register_cmd.extend(["--id", workspace_id])
+            if workspace_name:
+                register_cmd.extend(["--name", workspace_name])
+            commands.append(register_cmd)
+        if not commands:
+            QtWidgets.QMessageBox.information(self, APP_NAME, "Нет изменений для сохранения.")
+            return
+        self.set_running(True)
+        self.set_text(self.report_text, "Сохраняю настройки Patch Inbox...\n\n" + "\n".join("devctl " + " ".join(cmd) for cmd in commands) + "\n")
+        self.notebook.setCurrentIndex(2)
+        active_runner = self.runner
+
+        def worker() -> None:
+            results: list[tuple[list[str], RunResult]] = []
+            for command in commands:
+                result = active_runner.run(command, timeout=120)
+                results.append((command, result))
+                if not result.ok:
+                    break
+            self.events.put(("result", (self._on_patch_inbox_settings_done, results)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_patch_inbox_settings_done(self, results: list[tuple[list[str], RunResult]]) -> None:
+        self.set_running(False)
+        self.set_text(self.report_text, self._format_settings_results(results))
+        ok = all(result.ok and (not isinstance(result.json_data, dict) or result.json_data.get("ok", True)) for _command, result in results)
+        if ok:
+            self._set_next_action("grab_inbox_patch", "Patch Inbox настроен", "Склад патчей и registry workspace обновлены. Теперь можно положить patch.zip в incoming/ и забрать его кнопкой Patch Inbox.", "Забрать патч из склада", "ok")
+            QtWidgets.QMessageBox.information(self, APP_NAME, "Настройки Patch Inbox сохранены.")
+            self.refresh_status()
+        else:
+            self._set_next_action("configure_patch_inbox", "Настройки Patch Inbox не сохранены полностью", "Проверьте отчёт: одна из команд завершилась с ошибкой.", "Открыть настройки", "bad")
+            QtWidgets.QMessageBox.critical(self, APP_NAME, "Не удалось сохранить настройки Patch Inbox. Подробности во вкладке «Отчёт».")
+
+    def _format_settings_results(self, results: list[tuple[list[str], RunResult]]) -> str:
+        lines = ["== настройки Patch Inbox =="]
+        for command, result in results:
+            lines.extend(["", "$ devctl " + " ".join(command), f"Код возврата: {result.returncode}"])
+            data = result.json_data if isinstance(result.json_data, dict) else None
+            if data:
+                if command[:2] == ["inbox", "init"]:
+                    lines.extend([f"Склад: {data.get('path')}", f"Config: {data.get('configPath')}", f"Добавлен в config: {data.get('addedToConfig')}"])
+                    subdirs = data.get("subdirs") if isinstance(data.get("subdirs"), dict) else {}
+                    for name, path in subdirs.items():
+                        lines.append(f"  {name}: {path}")
+                elif command[:2] == ["workspace", "register"]:
+                    workspace = data.get("workspace") if isinstance(data.get("workspace"), dict) else {}
+                    lines.extend([f"Workspace ID: {workspace.get('id')}", f"Workspace name: {workspace.get('name')}", f"Workspace path: {workspace.get('path')}", f"Config: {data.get('configPath')}"])
+                else:
+                    lines.append(json.dumps(data, ensure_ascii=False, indent=2))
+            if result.stdout.strip() and not data:
+                lines.append(result.stdout.strip())
+            if result.stderr.strip():
+                lines.append("stderr:")
+                lines.append(result.stderr.strip())
+        return "\n".join(lines) + "\n"
 
     def choose_workspace(self) -> None:
         selected = QtWidgets.QFileDialog.getExistingDirectory(self, "Выберите корень рабочей области devctl")
@@ -1092,8 +1326,8 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
         self.set_text(self.report_text, self._format_inbox_scan_result(data, result))
         workspaces = data.get("workspaces") if isinstance(data.get("workspaces"), list) else []
         if not workspaces:
-            self._set_next_action("refresh_status", "Workspace не зарегистрированы для Patch Intake", "Выполните в нужном workspace: `devctl workspace register . --id <id>` и повторите импорт.", "Обновить статус", "bad")
-            QtWidgets.QMessageBox.critical(self, APP_NAME, "Нет зарегистрированных workspace для Patch Intake.")
+            self._set_next_action("configure_patch_inbox", "Workspace не зарегистрирован для Patch Intake", "Откройте настройки: GUI сможет указать путь до склада patch.zip и выполнить `devctl workspace register` для текущей рабочей области.", "Открыть настройки", "bad")
+            QtWidgets.QMessageBox.critical(self, APP_NAME, "Нет зарегистрированных workspace для Patch Intake. Откройте настройки Patch Inbox.")
             return
         dialog = WorkspaceChoiceDialog(self, workspaces=workspaces)
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted or not dialog.result:
@@ -1353,7 +1587,7 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
         self.runner.stream(args, on_line, on_done)
 
     def set_running(self, running: bool) -> None:
-        for widget in (self.main_button, *self.action_buttons, self.init_top_btn):
+        for widget in (self.main_button, *self.action_buttons, self.init_top_btn, self.settings_top_btn):
             widget.setEnabled(not running)
 
     def _on_start_done(self, result: RunResult) -> None:
@@ -1439,7 +1673,7 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
 def run_gui() -> int:
     if QT_IMPORT_ERROR is not None or QtWidgets is None:
         print(
-            "[ОШИБКА] devctl GUI v0.4.0 требует PySide6.\n"
+            "[ОШИБКА] devctl GUI v0.5.0 требует PySide6.\n"
             "Установите зависимость: python -m pip install PySide6\n"
             f"Исходная ошибка: {QT_IMPORT_ERROR}",
             file=sys.stderr,

@@ -4,7 +4,7 @@
 
 - Windows 10/11.
 - Python 3.11+.
-- Python-пакеты `PySide6` и `pyinstaller` для сборки/запуска GUI из исходников.
+- Python 3.11+; `build_exe.ps1` сам установит `pyinstaller` и `PySide6` в локальное `.venv`.
 - Git for Windows, если нужен реальный `commit/push` из конвейера.
 
 ## Команды сборки
@@ -24,7 +24,7 @@ pyinstaller build\pyinstaller.spec --clean --noconfirm
 .\build_exe.ps1
 ```
 
-Скрипт `build_exe.ps1` намеренно оставлен ASCII-only, чтобы Windows PowerShell 5 не ломался на UTF-8 без BOM.
+Скрипт `build_exe.ps1` намеренно оставлен ASCII-only, чтобы Windows PowerShell 5 не ломался на UTF-8 без BOM. Начиная с GUI v0.5.0 он также делает smoke-import PySide6 и проверяет собранный `.exe` через `--devctl-child`; при необходимости проверку можно пропустить ключом `-SkipSmokeTest`.
 
 Spec-файл сам находит корень проекта относительно `project/build/pyinstaller.spec`, поэтому кириллица и пробелы в пути допустимы. После успешной сборки файл будет здесь:
 
@@ -35,6 +35,7 @@ release/devctl-gui.exe
 ## Проверка EXE
 
 ```powershell
+.\release\devctl-gui.exe --devctl-child . --version
 .\release\devctl-gui.exe
 ```
 
@@ -82,3 +83,7 @@ devctl-gui.exe --devctl-child <workspace> <devctl args...>
 - `Remote-ссылка origin/<branch> не найдена`: для новых пустых remote новая версия не валит preflight заранее и позволит первому push создать ветку. Если ошибка всё равно появилась, проверьте URL, права доступа и наличие GitHub-репозитория.
 - При инициализации с GitHub URL GUI только связывает `origin`; авторизация для будущего push остаётся задачей Git/Git Credential Manager.
 - `Author identity unknown` при первом commit: настройте Git identity, например `git config --global user.name "Ваше имя"` и `git config --global user.email "you@example.com"`.
+
+## GUI v0.5.0 build fix
+
+GUI v0.5.0 усиливает сборку Windows EXE: `build_exe.ps1` устанавливает PySide6 в `.venv`, spec явно собирает PySide6-модули/динамические библиотеки, UPX отключён для Qt-библиотек, а после сборки выполняется child-mode smoke-test.

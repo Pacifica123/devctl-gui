@@ -143,3 +143,7 @@ patch_YYYYMMDD_HHMMSS_slug.zip
 ## GUI v0.4.0: Qt/PySide6
 
 GUI перенесён с Tkinter на Qt/PySide6. Функциональные сценарии сохранены: status, plan, start, start --no-push, sync, reset, init --upgrade, Patch Inbox, мастер нового workspace, live-лог и открытие отчётов/архивов/UTS/project. Для запуска из исходников установите `PySide6`; `build_exe.ps1` делает это автоматически при сборке Windows EXE.
+
+## GUI v0.5.0: settings and polish
+
+GUI v0.5.0 дорабатывает Qt-интерфейс без сброса версии/состояния: добавлены настройки Patch Inbox с выбором склада патчей и регистрацией текущего workspace, убраны непрозрачные фоны у QLabel внутри карточек, icon-панель переведена на стандартные Qt-иконки, а Windows-сборка усилена установкой PySide6 и smoke-test собранного EXE.
