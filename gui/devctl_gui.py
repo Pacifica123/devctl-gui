@@ -28,7 +28,7 @@ except ImportError:  # запуск как python -m gui.devctl_gui
     from .devctl_runner import DevctlRunner, RunResult  # type: ignore
 
 APP_NAME = "devctl GUI"
-APP_VERSION = "0.5.3"
+APP_VERSION = "0.5.4"
 BUNDLED_DEVCTL_VERSION = "0.7.0"
 
 PATCH_PROMPT_TEMPLATE = """Ты работаешь с devctl workspace и должен вернуть не полный архив проекта, а полноценный devctl-патч.
@@ -1772,10 +1772,11 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
         self.runner.stream(args, on_line, on_done)
 
     def set_running(self, running: bool) -> None:
+        enabled = not bool(running)
         for widget in (self.main_button, *self.action_buttons, self.init_top_btn, self.settings_top_btn):
-            widget.setEnabled(not running)
+            widget.setEnabled(enabled)
         if hasattr(self, "workspace_combo"):
-            self.workspace_combo.setEnabled((not running) and registered_workspaces())
+            self.workspace_combo.setEnabled(enabled and bool(registered_workspaces()))
 
     def _on_start_done(self, result: RunResult) -> None:
         self.set_running(False)
@@ -1860,7 +1861,7 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
 def run_gui() -> int:
     if QT_IMPORT_ERROR is not None or QtWidgets is None:
         print(
-            "[ОШИБКА] devctl GUI v0.5.3 требует PySide6.\n"
+            "[ОШИБКА] devctl GUI v0.5.4 требует PySide6.\n"
             "Установите зависимость: python -m pip install PySide6\n"
             f"Исходная ошибка: {QT_IMPORT_ERROR}",
             file=sys.stderr,
