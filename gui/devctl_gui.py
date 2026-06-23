@@ -28,7 +28,7 @@ except ImportError:  # запуск как python -m gui.devctl_gui
     from .devctl_runner import DevctlRunner, RunResult  # type: ignore
 
 APP_NAME = "devctl GUI"
-APP_VERSION = "0.5.2"
+APP_VERSION = "0.5.3"
 BUNDLED_DEVCTL_VERSION = "0.7.0"
 
 PATCH_PROMPT_TEMPLATE = """Ты работаешь с devctl workspace и должен вернуть не полный архив проекта, а полноценный devctl-патч.
@@ -682,17 +682,17 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
     def _setup_styles(self) -> None:
         self.colors = {
             "bg": "#0d1117",
-            "panel": "#161b22",
-            "panel2": "#010409",
+            "panel": "#171c23",
+            "panel2": "#02060c",
             "border": "#30363d",
             "text": "#c9d1d9",
             "muted": "#8b949e",
             "ok": "#3fb950",
             "warn": "#d29922",
             "bad": "#f85149",
-            "button": "#21262d",
-            "button_active": "#30363d",
-            "entry": "#0d1117",
+            "button": "#20252d",
+            "button_active": "#2a3039",
+            "entry": "#10151c",
             "select": "#264f78",
             "accent": "#238636",
             "accent_hover": "#2ea043",
@@ -726,7 +726,7 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
             }}
             QFrame#StatusCard, QFrame#NextActionCard {{
                 background: {c['panel']};
-                border: 1px solid {c['border']};
+                border: none;
                 border-radius: 14px;
             }}
             QLabel#CardTitle {{
@@ -749,7 +749,7 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
             QLineEdit, QComboBox {{
                 background: {c['entry']};
                 color: {c['text']};
-                border: 1px solid {c['border']};
+                border: none;
                 border-radius: 10px;
                 padding: 8px 10px;
                 selection-background-color: {c['select']};
@@ -770,14 +770,14 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
             QComboBox QAbstractItemView {{
                 background: {c['panel']};
                 color: {c['text']};
-                border: 1px solid {c['border']};
+                border: none;
                 selection-background-color: {c['select']};
                 padding: 4px;
             }}
             QPushButton {{
                 background: {c['button']};
                 color: {c['text']};
-                border: 1px solid {c['border']};
+                border: none;
                 border-radius: 10px;
                 padding: 8px 12px;
                 min-height: 22px;
@@ -788,7 +788,7 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
             QPushButton#MagicButton {{
                 background: {c['accent']};
                 color: white;
-                border: 1px solid {c['accent_hover']};
+                border: none;
                 border-radius: 14px;
                 padding: 13px 18px;
                 font-size: 13pt;
@@ -796,29 +796,26 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
             }}
             QPushButton#MagicButton:hover {{ background: {c['accent_hover']}; }}
             QToolButton#ToolIconButton {{
-                background: #1b212a;
+                background: {c['button']};
                 color: {c['text']};
-                border: 1px solid #343c49;
-                border-radius: 12px;
-                padding: 7px;
+                border: none;
+                border-radius: 13px;
+                padding: 8px;
                 min-width: 36px;
-                min-height: 30px;
+                min-height: 34px;
             }}
             QToolButton#ToolIconButton:hover {{
-                background: #243041;
-                border-color: #4b5f79;
+                background: {c['button_active']};
             }}
             QToolButton#ToolIconButton:pressed {{
-                background: #1f6feb;
-                border-color: #58a6ff;
+                background: #24364a;
             }}
             QToolButton#ToolIconButton:disabled {{
                 color: #6e7681;
-                background: #161b22;
-                border-color: {c['border']};
+                background: #171c23;
             }}
             QTabWidget::pane {{
-                border: 1px solid {c['border']};
+                border: none;
                 border-radius: 12px;
                 top: -1px;
                 background: {c['panel2']};
@@ -826,8 +823,7 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
             QTabBar::tab {{
                 background: {c['button']};
                 color: {c['muted']};
-                border: 1px solid {c['border']};
-                border-bottom: none;
+                border: none;
                 border-top-left-radius: 10px;
                 border-top-right-radius: 10px;
                 padding: 8px 14px;
@@ -854,7 +850,7 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
                 min-height: 24px;
             }}
             QGroupBox {{
-                border: 1px solid {c['border']};
+                border: none;
                 border-radius: 12px;
                 margin-top: 10px;
                 padding: 14px 10px 10px 10px;
@@ -873,9 +869,9 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
 
         The previous GUI versions used either OS standard icons or QPainter
         glyphs. Standard icons look inconsistent on Windows dark themes, while
-        code-drawn glyphs are hard to audit and tune. SVG assets are a cleaner
-        middle ground: they are local, theme-independent, editable, flat, and
-        bundled into the EXE by PyInstaller.
+        code-drawn glyphs are hard to audit and tune. The local SVG set keeps
+        the toolbar dependency-free, editable, minimalist, and bundled into the
+        EXE by PyInstaller.
         """
         icon_path = bundled_root() / "gui" / "assets" / "icons" / f"{name}.svg"
         if icon_path.exists():
@@ -906,7 +902,7 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
         button.setObjectName("ToolIconButton")
         button.setAutoRaise(False)
         button.setIcon(self._flat_icon(icon_name))
-        button.setIconSize(QtCore.QSize(22, 22))
+        button.setIconSize(QtCore.QSize(20, 20))
         button.setToolTip(tooltip)
         button.setAccessibleName(tooltip)
         button.clicked.connect(lambda _checked=False, cmd=command: self._guard(cmd))
@@ -1864,7 +1860,7 @@ class DevctlGui(QtWidgets.QMainWindow if QtWidgets else object):
 def run_gui() -> int:
     if QT_IMPORT_ERROR is not None or QtWidgets is None:
         print(
-            "[ОШИБКА] devctl GUI v0.5.2 требует PySide6.\n"
+            "[ОШИБКА] devctl GUI v0.5.3 требует PySide6.\n"
             "Установите зависимость: python -m pip install PySide6\n"
             f"Исходная ошибка: {QT_IMPORT_ERROR}",
             file=sys.stderr,
