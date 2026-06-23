@@ -17,8 +17,8 @@ except ImportError:  # запуск как python -m gui.devctl_gui
     from .devctl_runner import DevctlRunner, RunResult  # type: ignore
 
 APP_NAME = "devctl GUI"
-APP_VERSION = "0.2.7"
-BUNDLED_DEVCTL_VERSION = "0.6.7"
+APP_VERSION = "0.3.0"
+BUNDLED_DEVCTL_VERSION = "0.7.0"
 
 
 PATCH_PROMPT_TEMPLATE = """Ты работаешь с devctl workspace и должен вернуть не полный архив проекта, а полноценный devctl-патч.
@@ -28,7 +28,7 @@ PATCH_PROMPT_TEMPLATE = """Ты работаешь с devctl workspace и дол
 - devctl применяет patch.zip из patches/ к папке project/;
 - патч должен быть безопасным, воспроизводимым и понятным человеку;
 - GUI/CLI ожидают структуру patch.zip с manifest.json, PATCH_SUMMARY.md и files/.
-- devctl умеет reset, init --upgrade, автооткат failed start, UTS и автоочистку Python bytecode/cache.
+- devctl умеет reset, init --upgrade, автооткат failed start, UTS, Patch Intake (`inbox`) и автоочистку Python bytecode/cache.
 
 Твоя задача:
 1. Изучи текущие файлы проекта, которые нужно менять. Не придумывай содержимое вслепую.
@@ -52,6 +52,7 @@ patch_YYYYMMDD_HHMMSS_short_slug.zip
 - не клади абсолютные пути;
 - не клади .git/, .env, секреты, __pycache__/, *.pyc, *.pyo, .pytest_cache/, .venv/, dist/, build/, node_modules/;
 - если devctl копирует целые файлы, клади в files/ уже финальные версии изменённых файлов;
+- по возможности заполняй manifest.target: projectId/workspaceId/projectName и expectedFiles, чтобы `devctl inbox grab` мог сам доставить patch.zip в правильный workspace;
 - не меняй unrelated-файлы ради косметики.
 
 Минимальный manifest.json:
@@ -67,6 +68,12 @@ patch_YYYYMMDD_HHMMSS_short_slug.zip
   "base": {
     "branch": "main",
     "expectedHead": null
+  },
+  "target": {
+    "projectId": "devctl",
+    "workspaceId": "devctl",
+    "projectName": "devctl universal",
+    "expectedFiles": ["devctl.py", "README.md"]
   },
   "apply": {
     "filesRoot": "files",
@@ -446,6 +453,66 @@ class InitWorkspaceDialog(tk.Toplevel):
         self.destroy()
 
 
+class WorkspaceChoiceDialog(tk.Toplevel):
+    """Modal-dialog для ручного выбора workspace при неоднозначном Patch Intake."""
+
+    def __init__(self, master: tk.Misc, *, workspaces: list[dict]) -> None:
+        super().__init__(master)
+        self.title("Выбор workspace для патча")
+        self.resizable(True, False)
+        self.result: str | None = None
+        self.workspaces = workspaces
+
+        body = ttk.Frame(self, padding=16)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Patch target is unclear", font=("Segoe UI", 13, "bold")).pack(anchor="w", pady=(0, 8))
+        ttk.Label(
+            body,
+            text="devctl не смог уверенно выбрать workspace. Укажите, куда импортировать последний patch.zip из Patch Inbox.",
+            wraplength=620,
+        ).pack(anchor="w", pady=(0, 10))
+
+        self.listbox = tk.Listbox(body, height=min(max(len(workspaces), 3), 10), width=88)
+        self.listbox.pack(fill="x", expand=True, pady=(0, 12))
+        for record in workspaces:
+            workspace_id = record.get("id") or "unknown"
+            name = record.get("name") or ""
+            path = record.get("path") or ""
+            self.listbox.insert("end", f"{workspace_id}    {name}    {path}")
+        if workspaces:
+            self.listbox.selection_set(0)
+            self.listbox.activate(0)
+
+        buttons = ttk.Frame(body)
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="Отмена", command=self.cancel).pack(side="right")
+        ttk.Button(buttons, text="Импортировать сюда", command=self.accept).pack(side="right", padx=(0, 8))
+
+        self.transient(master)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self.cancel)
+        self.bind("<Return>", lambda _event: self.accept())
+        self.bind("<Escape>", lambda _event: self.cancel())
+        self.after(50, self.listbox.focus_set)
+
+    def accept(self) -> None:
+        selection = self.listbox.curselection()
+        if not selection:
+            messagebox.showerror(APP_NAME, "Выберите workspace.", parent=self)
+            return
+        record = self.workspaces[int(selection[0])]
+        workspace_id = record.get("id")
+        if not workspace_id:
+            messagebox.showerror(APP_NAME, "У выбранного workspace нет id.", parent=self)
+            return
+        self.result = str(workspace_id)
+        self.destroy()
+
+    def cancel(self) -> None:
+        self.result = None
+        self.destroy()
+
+
 class DevctlGui(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -599,6 +666,7 @@ class DevctlGui(tk.Tk):
         self.init_btn = self._make_icon_button(actions, "＋", "Инициализировать workspace", self.init_workspace)
         self.status_btn = self._make_icon_button(actions, "●", "Показать статус", self.refresh_status)
         self.sync_btn = self._make_icon_button(actions, "⇄", "Синхронизировать workspace с GitHub: project -> archives -> UTS", self.sync_workspace)
+        self.inbox_btn = self._make_icon_button(actions, "⇩", "Забрать patch.zip из Patch Inbox", self.grab_inbox_patch)
         self.plan_btn = self._make_icon_button(actions, "☷", "Построить dry-run план", self.build_plan)
         self.start_btn = self._make_icon_button(actions, "▶", "Запустить конвейер с push по плану", lambda: self.start_pipeline(False))
         self.no_push_btn = self._make_icon_button(actions, "⊘", "Запустить конвейер без push", lambda: self.start_pipeline(True))
@@ -614,6 +682,7 @@ class DevctlGui(tk.Tk):
             self.init_btn,
             self.status_btn,
             self.sync_btn,
+            self.inbox_btn,
             self.plan_btn,
             self.start_btn,
             self.no_push_btn,
@@ -691,6 +760,7 @@ class DevctlGui(tk.Tk):
             "choose_workspace": self.choose_workspace,
             "refresh_status": self.refresh_status,
             "sync_workspace": self.sync_workspace,
+            "grab_inbox_patch": self.grab_inbox_patch,
             "open_patches": self.open_patches,
             "open_project": self.open_project,
             "show_git_status": self.show_git_status,
@@ -784,10 +854,10 @@ class DevctlGui(tk.Tk):
                 )
             else:
                 self._set_next_action(
-                    "sync_workspace",
-                    "Синхронизировать workspace с GitHub",
-                    "Неприменённых патчей нет. Можно одной кнопкой привести project/ к актуальному origin/ветке, затем создать свежий архив в archives/ и развернуть копию в UserTestSpace/. Для нового патча по-прежнему можно открыть patches/ нижней кнопкой.",
-                    "Sync from GitHub",
+                    "grab_inbox_patch",
+                    "Забрать новый patch.zip из Patch Inbox",
+                    "Неприменённых патчей в patches/ нет. Если patch.zip уже лежит в общем складе, GUI вызовет `devctl inbox grab --json`: ядро само определит workspace, скопирует архив в patches/ и не будет применять его автоматически.",
+                    "Забрать патч из склада",
                     "ok",
                 )
             return
@@ -1177,6 +1247,152 @@ class DevctlGui(tk.Tk):
         lines.extend([f"- {item}" for item in errors] or ["нет"])
         return "\n".join(lines) + "\n"
 
+    def grab_inbox_patch(self, workspace_id: str | None = None, *, allow_choice: bool = True) -> None:
+        self._save_workspace()
+        self.set_running(True)
+        self.set_text(self.report_text, "Забираю patch.zip из Patch Inbox...\n")
+        self.notebook.select(2)
+        args = ["inbox", "grab", "--json"]
+        if workspace_id:
+            args.extend(["--workspace", workspace_id])
+        self._run_async(args, lambda result: self._on_inbox_grab_done(result, allow_choice=allow_choice), timeout=240)
+
+    def _on_inbox_grab_done(self, result: RunResult, *, allow_choice: bool = True) -> None:
+        self.set_running(False)
+        data = result.json_data or {}
+        if result.ok and isinstance(data, dict) and data.get("ok"):
+            self.set_text(self.report_text, self._format_inbox_grab_result(data, result))
+            imported = [item for item in (data.get("results") or []) if isinstance(item, dict) and item.get("status") == "imported"]
+            if imported:
+                self._set_next_action(
+                    "build_plan",
+                    "Патч импортирован в patches/",
+                    "Patch Intake только доставил архив. Следующий безопасный шаг — построить dry-run план и уже потом запускать конвейер.",
+                    "Построить план",
+                    "ok",
+                )
+                messagebox.showinfo(APP_NAME, "Патч импортирован. Теперь можно построить план.", parent=self)
+            else:
+                self._set_next_action(
+                    "refresh_status",
+                    "Patch Inbox обработан",
+                    "Импорт не создал нового patch.zip для запуска. Проверьте отчёт и обновите статус.",
+                    "Обновить статус",
+                    "warn",
+                )
+            self.refresh_status()
+            return
+
+        self.set_text(self.report_text, self._format_inbox_grab_result(data if isinstance(data, dict) else {}, result))
+        if allow_choice:
+            self.set_text(self.report_text, self.report_text.get("1.0", "end") + "\nПробую получить список workspace для ручного выбора...\n")
+            self.set_running(True)
+            self._run_async(["inbox", "scan", "--json"], self._on_inbox_scan_for_choice, timeout=120)
+            return
+
+        self._set_next_action(
+            "grab_inbox_patch",
+            "Не удалось забрать патч из склада",
+            result.stderr or result.stdout or "Проверьте, настроен ли Patch Inbox (`devctl inbox init`) и зарегистрирован ли workspace (`devctl workspace register`).",
+            "Повторить inbox grab",
+            "bad",
+        )
+        messagebox.showerror(APP_NAME, "Не удалось забрать патч. Подробности во вкладке «Отчёт».", parent=self)
+
+    def _on_inbox_scan_for_choice(self, result: RunResult) -> None:
+        self.set_running(False)
+        data = result.json_data or {}
+        if not isinstance(data, dict) or not data.get("ok"):
+            self.set_text(self.report_text, (result.stdout or "") + ("\n" + result.stderr if result.stderr else ""))
+            messagebox.showerror(APP_NAME, "Не удалось получить список workspace для выбора.", parent=self)
+            return
+        self.set_text(self.report_text, self._format_inbox_scan_result(data, result))
+        workspaces = data.get("workspaces") if isinstance(data.get("workspaces"), list) else []
+        if not workspaces:
+            self._set_next_action(
+                "refresh_status",
+                "Workspace не зарегистрированы для Patch Intake",
+                "Выполните в нужном workspace: `devctl workspace register . --id <id>` и повторите импорт.",
+                "Обновить статус",
+                "bad",
+            )
+            messagebox.showerror(APP_NAME, "Нет зарегистрированных workspace для Patch Intake.", parent=self)
+            return
+        dialog = WorkspaceChoiceDialog(self, workspaces=workspaces)
+        self.wait_window(dialog)
+        if not dialog.result:
+            self._set_next_action(
+                "grab_inbox_patch",
+                "Импорт патча отменён",
+                "Выбор workspace был отменён. Patch.zip остался в исходном складе.",
+                "Забрать патч из склада",
+                "warn",
+            )
+            return
+        self.grab_inbox_patch(dialog.result, allow_choice=False)
+
+    def _format_inbox_scan_result(self, data: dict, result: RunResult) -> str:
+        if not data:
+            return (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
+        lines = [
+            "== Patch Inbox scan ==",
+            f"devctl: v{data.get('version')}",
+            f"Config: {data.get('configPath')}",
+            "",
+            "== склады ==",
+        ]
+        lines.extend([f"- {item}" for item in data.get("patchInboxDirs") or []] or ["не настроены"])
+        lines.append("")
+        lines.append("== зарегистрированные workspace ==")
+        for record in data.get("workspaces") or []:
+            lines.append(f"- {record.get('id')} · {record.get('name')} · {record.get('path')}")
+        if not data.get("workspaces"):
+            lines.append("нет")
+        lines.append("")
+        lines.append("== патчи ==")
+        patches = data.get("patches") if isinstance(data.get("patches"), dict) else {}
+        for item in patches.get("items") or []:
+            target = item.get("target") if isinstance(item.get("target"), dict) else {}
+            lines.append(f"- {item.get('name')}: {item.get('status')}, target={target.get('workspaceId') or 'unknown'}, confidence={target.get('confidence')}, reason={target.get('reason') or 'нет'}")
+        if not patches.get("items"):
+            lines.append("zip-патчи не найдены")
+        return "\n".join(lines) + "\n"
+
+    def _format_inbox_grab_result(self, data: dict, result: RunResult) -> str:
+        if not data:
+            return (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
+        lines = [
+            "== Patch Inbox grab ==",
+            f"Статус: {'OK' if data.get('ok') else 'ошибка'}",
+            f"Dry-run: {data.get('dryRun')}",
+            f"Config: {data.get('configPath')}",
+            f"Index: {data.get('indexPath')}",
+            "",
+            "== результаты ==",
+        ]
+        results = data.get("results") if isinstance(data.get("results"), list) else []
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            status = item.get("status")
+            if status == "imported":
+                lines.append(f"- imported: {item.get('originalName')} -> {item.get('importedTo')}")
+                lines.append(f"  original: {item.get('movedOriginalTo')}")
+                lines.append(f"  workspace: {item.get('workspaceId')} confidence={item.get('confidence')}")
+            elif status == "would_import":
+                lines.append(f"- would import: {item.get('name')} -> {item.get('copyTo')}")
+            elif status == "duplicate":
+                lines.append(f"- duplicate: {item.get('name')} -> {item.get('movedTo') or 'оставлен на месте'}")
+            else:
+                lines.append(f"- {status}: {item}")
+        if not results:
+            lines.append("нет")
+        errors = data.get("errors") if isinstance(data.get("errors"), list) else []
+        lines.append("")
+        lines.append("== ошибки ==")
+        lines.extend([f"- {item}" for item in errors] or [result.stderr or result.stdout or "нет"])
+        return "\n".join(lines) + "\n"
+
     def upgrade_workspace(self) -> None:
         self._save_workspace()
         proceed = messagebox.askyesno(
@@ -1513,7 +1729,7 @@ class DevctlGui(tk.Tk):
 
     def set_running(self, running: bool) -> None:
         state = "disabled" if running else "normal"
-        for widget in (self.main_button, self.start_btn, self.no_push_btn, self.status_btn, self.sync_btn, self.plan_btn, self.init_btn, self.init_top_btn, self.upgrade_btn, self.reset_btn, self.report_btn, self.archives_btn, self.uts_btn, self.project_btn, self.copy_output_btn, self.copy_prompt_btn):
+        for widget in (self.main_button, self.start_btn, self.no_push_btn, self.status_btn, self.sync_btn, self.inbox_btn, self.plan_btn, self.init_btn, self.init_top_btn, self.upgrade_btn, self.reset_btn, self.report_btn, self.archives_btn, self.uts_btn, self.project_btn, self.copy_output_btn, self.copy_prompt_btn):
             widget.configure(state=state)
 
     def _on_start_done(self, result: RunResult) -> None:
